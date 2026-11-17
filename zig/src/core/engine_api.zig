@@ -93,6 +93,8 @@ pub const Request = struct {
     cache_key: []const u32 = &.{},
     /// A streamed reply's tokens its client has not read yet (the server's mailbox counts them); null: not watched.
     unread: ?*const std.atomic.Value(u32) = null,
+    /// ``cache_key`` is salted (cache_salt): the lane host neither drafts from nor adds to Recall's shared record.
+    salted: bool = false,
 
     /// The prompt as the prompt cache matches it: an image request's placeholders stand for their images.
     pub fn cacheKey(r: *const Request) []const u32 {
@@ -208,6 +210,8 @@ pub const Info = struct {
     prefill_min_chunk: u32 = 256,
     /// The engine keeps prompt states between requests, so ``prefilled`` counts the tokens it restored.
     prompt_cache: bool = false,
+    /// Requests may carry cache_salt: its prompt cache goes by Request.cacheKey() (the lane host's), apart per salt.
+    cache_salt: bool = false,
     /// Startup cache budget and the smallest state admitted by the family's existing keep plan.
     prompt_cache_capacity: ?PromptCacheCapacity = null,
     /// The policy the engine runs under, one line (`/health` shows it); empty: none.
@@ -562,6 +566,7 @@ pub const prefill_env = @import("lane_host_env.zig");
 pub const Rounds = @import("lane_host.zig").Rounds;
 /// Exact prompt reuse between requests, for any family (prompt_cache.zig).
 pub const prompt_cache = @import("prompt_cache.zig");
+pub const cache_salt_key = @import("cache_salt_key.zig");
 /// The same for a paged cache over the backend's own KV pages (prompt_radix.zig).
 pub const prompt_radix = @import("prompt_radix.zig");
 /// Decoded prompt rows as canonical spans, for a cache keyed by the arithmetic that made each row (cache_modes.zig).
