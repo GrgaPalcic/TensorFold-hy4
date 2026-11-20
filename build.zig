@@ -212,6 +212,7 @@ pub fn build(b: *std.Build) void {
     @import("zig/build/glm_pdl_scan.zig").add(b);
     @import("zig/build/living_tools_host.zig").steps(b);
     cuda_build.hostTests(b, draft_ids, build_options, test_step, target.result.os.tag != .macos);
+    @import("zig/build/pull_tests.zig").compile(b, target, draft_ids);
     @import("zig/build/env_defaults.zig").steps(b, draft_ids, test_step);
     if (target.result.os.tag != .macos) @import("zig/build/qwen3_cuda.zig").steps(b, target, optimize, cuda_options, test_step);
     xpu_build.hostTests(b, test_step);
