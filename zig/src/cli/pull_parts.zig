@@ -123,11 +123,10 @@ fn range(s: *Shared, client: *std.http.Client, p: Piece, done: *u64) !void {
     if (from >= p.end) return;
     var range_buf: [64]u8 = undefined;
     const headers = [_]std.http.Header{.{ .name = "Range", .value = try std.fmt.bufPrint(&range_buf, "bytes={d}-{d}", .{ from, p.end - 1 }) }};
-    var req = try client.request(.GET, try std.Uri.parse(s.files[p.file].url), .{ .extra_headers = &headers, .headers = .{ .accept_encoding = .{ .override = "identity" } } });
-    defer req.deinit();
-    try req.sendBodiless();
+    var req: std.http.Client.Request = undefined;
     var redirect_buf: [8 << 10]u8 = undefined;
-    var response = try req.receiveHead(&redirect_buf);
+    var response = try @import("pull_get.zig").open(client, &req, .GET, s.files[p.file].url, &headers, &redirect_buf);
+    defer req.deinit();
     if (response.head.status != .partial_content or startOf(response.head) != from) return error.RangeUnsupported;
     var reader_buf: [64 << 10]u8 = undefined;
     var r = response.reader(&reader_buf);

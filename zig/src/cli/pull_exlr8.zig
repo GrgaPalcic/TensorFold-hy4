@@ -19,10 +19,13 @@ pub fn run(a: Allocator, io: std.Io, out: *std.Io.Writer, err_out: *std.Io.Write
     const repo = if (at) |i| spec[0..i] else spec;
     const revision = if (at) |i| spec[i + 1 ..] else "main";
     const endpoint = pull.envValue(env, "HF_ENDPOINT") orelse "https://huggingface.co";
+    if (!try pull.routes(a, io, err_out, env)) return 2;
     var client = @import("pull_http.zig").client(a, io);
     defer client.deinit();
     const sha = pull.resolveRevision(a, &client, out, endpoint, repo, revision) catch |e| {
-        try err_out.print("{s}@{s}: the hub did not name a commit ({t})\n", .{ repo, revision, e });
+        try err_out.print("{s}@{s}: the hub did not name a commit: ", .{ repo, revision });
+        try @import("pull_route.zig").explain(io, err_out, e);
+        try err_out.writeAll("\n");
         return 1;
     };
     const entries = pull.listTree(a, &client, endpoint, repo, sha) catch |e| {

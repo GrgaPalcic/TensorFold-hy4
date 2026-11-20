@@ -189,6 +189,7 @@ fn forget(s: *Shared, file: u32, link: []const u8) void {
 
 /// Where `url` lands: the Location of a redirect, else `url` itself.
 pub fn resolve(a: Allocator, client: *std.http.Client, url: []const u8) ![]u8 {
+    try @import("pull_route.zig").note(client.io, try std.Uri.parse(url));
     var req = try client.request(.HEAD, try std.Uri.parse(url), .{ .redirect_behavior = .unhandled, .headers = .{ .accept_encoding = .{ .override = "identity" } } });
     defer req.deinit();
     try req.sendBodiless();
@@ -206,6 +207,7 @@ pub fn resolve(a: Allocator, client: *std.http.Client, url: []const u8) ![]u8 {
 fn get(client: *std.http.Client, link: []const u8, first: u64, buf: []u8) !void {
     var range_buf: [64]u8 = undefined;
     const headers = [_]std.http.Header{.{ .name = "Range", .value = try std.fmt.bufPrint(&range_buf, "bytes={d}-{d}", .{ first, first + buf.len - 1 }) }};
+    try @import("pull_route.zig").note(client.io, try std.Uri.parse(link));
     var req = try client.request(.GET, try std.Uri.parse(link), .{ .redirect_behavior = .not_allowed, .extra_headers = &headers, .headers = .{ .accept_encoding = .{ .override = "identity" } } });
     defer req.deinit();
     try req.sendBodiless();

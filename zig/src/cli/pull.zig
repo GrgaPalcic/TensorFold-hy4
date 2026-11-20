@@ -10,6 +10,7 @@ const fileStat = single.fileStat;
 const downloadRetrying = single.downloadRetrying;
 const linkIntoSnapshot = single.linkIntoSnapshot;
 const revisionOk = hub.revisionOk;
+const route = @import("pull_route.zig");
 
 pub const GiB: u64 = 1 << 30;
 
@@ -33,6 +34,7 @@ pub fn runWith(a: Allocator, io: std.Io, out: *std.Io.Writer, err_out: *std.Io.W
         return 2;
     }
     const endpoint = envValue(env, "HF_ENDPOINT") orelse "https://huggingface.co";
+    if (!try routes(a, io, err_out, env)) return 2;
     const root = try hub.cacheDir(a, env, override);
     const w = std.Io.Dir.cwd();
     try w.createDirPath(io, root);
@@ -51,7 +53,9 @@ pub fn runWith(a: Allocator, io: std.Io, out: *std.Io.Writer, err_out: *std.Io.W
             return 1;
         },
         else => {
-            try err_out.print("{s}@{s}: the hub is unreachable ({t}); check the network or HF_ENDPOINT\n", .{ repo, revision, e });
+            try err_out.print("{s}@{s}: the hub at {s} is unreachable: ", .{ repo, revision, endpoint });
+            try route.explain(io, err_out, e);
+            try err_out.writeAll("; check the network, HF_ENDPOINT or the proxy settings\n");
             return 1;
         },
     };
@@ -59,7 +63,9 @@ pub fn runWith(a: Allocator, io: std.Io, out: *std.Io.Writer, err_out: *std.Io.W
     const entries = listTree(a, &client, endpoint, repo, sha) catch |e| switch (e) {
         error.HubStatus, error.NoConfig => return 1,
         else => {
-            try err_out.print("{s}@{s}: the hub's file tree is unreachable ({t})\n", .{ repo, revision, e });
+            try err_out.print("{s}@{s}: the hub's file tree is unreachable: ", .{ repo, revision });
+            try route.explain(io, err_out, e);
+            try err_out.writeAll("\n");
             return 1;
         },
     };
@@ -115,7 +121,7 @@ pub fn runWith(a: Allocator, io: std.Io, out: *std.Io.Writer, err_out: *std.Io.W
             continue;
         }
         const got = downloadRetrying(a, io, &client, out, url, blobs_dir, e) catch |err| {
-            try err_out.print("  {s}: the download failed ({t})\n", .{ e.path, err });
+            try failed(io, err_out, e.path, err);
             return 1;
         };
         try linkIntoSnapshot(a, io, snapshot_dir, e.path, got);
@@ -136,7 +142,7 @@ fn fetchBig(a: Allocator, io: std.Io, client: *std.http.Client, out: *std.Io.Wri
             for (big) |b| {
                 ranged.discard(a, io, b.file, piece); // the hub sent whole files: one stream each
                 const got = downloadRetrying(a, io, client, out, b.file.url, blobs_dir, b.entry) catch |e| {
-                    try err_out.print("  {s}: the download failed ({t})\n", .{ b.entry.path, e });
+                    try failed(io, err_out, b.entry.path, e);
                     return false;
                 };
                 try linkIntoSnapshot(a, io, snapshot_dir, b.entry.path, got);
@@ -144,7 +150,9 @@ fn fetchBig(a: Allocator, io: std.Io, client: *std.http.Client, out: *std.Io.Wri
             return true;
         },
         else => {
-            try err_out.print("  the download failed ({t}); pull again to fetch only the missing pieces\n", .{err});
+            try err_out.writeAll("  the download failed: ");
+            try route.explain(io, err_out, err);
+            try err_out.writeAll("; pull again to fetch only the missing pieces\n");
             return false;
         },
     };
@@ -152,7 +160,7 @@ fn fetchBig(a: Allocator, io: std.Io, client: *std.http.Client, out: *std.Io.Wri
         if (!try matches(a, io, b)) {
             ranged.discard(a, io, b.file, piece);
             ranged.fetch(a, io, &.{b.file}, piece, out) catch |err| {
-                try err_out.print("  {s}: the download failed ({t})\n", .{ b.entry.path, err });
+                try failed(io, err_out, b.entry.path, err);
                 return false;
             };
             if (!try matches(a, io, b)) {
@@ -170,6 +178,31 @@ fn fetchBig(a: Allocator, io: std.Io, client: *std.http.Client, out: *std.Io.Wri
 
 fn matches(a: Allocator, io: std.Io, b: Big) !bool {
     return std.mem.eql(u8, &(try ranged.digest(a, io, b.file.path, b.file.size)), &b.entry.sha256.?);
+}
+
+/// Reads the proxy and timeout settings; false (after saying why, naming only the variable) when one is unusable.
+pub fn routes(a: Allocator, io: std.Io, err_out: *std.Io.Writer, env: ?*const std.process.Environ.Map) !bool {
+    route.reset(io);
+    route.configure(a, env) catch |e| {
+        try err_out.writeAll("tensorfold pull: ");
+        try route.refusal(err_out, e);
+        try err_out.writeAll("\n");
+        return false;
+    };
+    return true;
+}
+
+/// One file's failure: a stall names its timeout, its resumes and the proxy in use; others what the connect met.
+pub fn failed(io: std.Io, err_out: *std.Io.Writer, path: []const u8, err: anyerror) !void {
+    if (err == error.Stalled) {
+        try err_out.print("  {s}: no bytes arrived for {d} s ({s}), and {d} range resumes stalled too; ", .{ path, route.settings.stall_s, route.stall_name, single.max_resumes });
+        try route.proxyInUse(err_out);
+        try err_out.writeAll("; pull again to resume\n");
+        return;
+    }
+    try err_out.print("  {s}: the download failed: ", .{path});
+    try route.explain(io, err_out, err);
+    try err_out.writeAll("\n");
 }
 
 pub fn envValue(env: ?*const std.process.Environ.Map, key: []const u8) ?[]const u8 {
@@ -252,17 +285,13 @@ fn parseHex(comptime n: usize, text: []const u8) ?[n]u8 {
 /// One small file fetched whole into memory.
 fn fetchOne(a: Allocator, client: *std.http.Client, endpoint: []const u8, repo: []const u8, sha: []const u8, path: []const u8) ![]u8 {
     const url = try std.fmt.allocPrint(a, "{s}/{s}/resolve/{s}/{s}", .{ endpoint, repo, sha, path });
-    var body: std.Io.Writer.Allocating = .init(a);
-    const result = client.fetch(.{ .location = .{ .url = url }, .response_writer = &body.writer }) catch return error.HubUnreachable;
-    if (result.status != .ok) return error.HubStatus;
-    return body.toOwnedSlice();
+    return getJson(a, client, url);
 }
 
 fn getJson(a: Allocator, client: *std.http.Client, url: []const u8) ![]u8 {
-    var body: std.Io.Writer.Allocating = .init(a);
-    const result = client.fetch(.{ .location = .{ .url = url }, .response_writer = &body.writer }) catch return error.HubUnreachable;
-    if (result.status != .ok) return error.HubStatus;
-    return body.toOwnedSlice();
+    const status, const bytes = @import("pull_get.zig").body(a, client, url) catch return error.HubUnreachable;
+    if (status != .ok) return error.HubStatus;
+    return bytes;
 }
 
 test "an LFS oid names its sha256 with or without the sha256: prefix" {
