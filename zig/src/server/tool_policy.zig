@@ -10,9 +10,9 @@ fn nameLike(s: []const u8) bool {
     return true;
 }
 
-/// ``(?:NAME:)?tool_call``, any case.
+/// ``(?:NAME:)?tool_call``, or Hy4's ``tool_calls`` / ``tool_calls:HYTK`` / ``tool_call:HYTK``, any case.
 pub fn callTag(name: []const u8) bool {
-    if (std.ascii.eqlIgnoreCase(name, "tool_call")) return true;
+    if (std.ascii.eqlIgnoreCase(name, "tool_call") or @import("tool_hy4.zig").policyTag(name)) return true;
     const colon = std.mem.indexOfScalar(u8, name, ':') orelse return false;
     return nameLike(name[0..colon]) and std.ascii.eqlIgnoreCase(name[colon + 1 ..], "tool_call");
 }
@@ -65,8 +65,8 @@ pub const TextFilter = struct {
                 if (!finished) {
                     const name = rest[1..];
                     const colon = std.mem.indexOfScalar(u8, name, ':');
-                    const possible = name.len == 0 or nameLike(name) or (colon != null and nameLike(name[0..colon.?]) and
-                        std.ascii.startsWithIgnoreCase("tool_call", name[colon.? + 1 ..]));
+                    const possible = name.len == 0 or nameLike(name) or @import("tool_hy4.zig").policyPartial(name) or
+                        (colon != null and nameLike(name[0..colon.?]) and std.ascii.startsWithIgnoreCase("tool_call", name[colon.? + 1 ..]));
                     if (possible) {
                         f.sent = start;
                         f.scan = start;

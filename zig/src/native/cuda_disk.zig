@@ -238,11 +238,49 @@ pub fn keptDisk(comptime F: type) ?type {
     return if (@hasDecl(F, "kept_disk")) F.kept_disk else null;
 }
 
+pub fn supportsShareDisk(comptime F: type) bool {
+    return @hasDecl(F, "share_disk");
+}
+
+/// Opens a standalone `rows.Rows` disk store before `Adapter.open` attaches `TF_KV_SHARE` (`K.probe` runs on rank 0).
+pub fn openShareDisk(comptime F: type, gpa: Allocator, a: Allocator, io: std.Io, ctx: *const cuda.Context, o: api.Open, root: []const u8, kernels: ?[]const u8, loaded: anytype) !?*rows.Rows {
+    const K = keptDisk(F) orelse return null;
+    if (@hasDecl(K, "bind")) K.bind(loaded.target, ctx);
+    if (o.rank > 0) return null;
+    const p = try K.probe(a, io, loaded.backend, loaded.target);
+    const staging = stagingOf(K, loaded.target);
+    const id = try keptKey(K, a, io, ctx, o.dir, kernels, loaded.target, p.hash, .{ .family = F.model_type, .backend = "cuda" });
+    const key = if (comptime @hasDecl(K, "prompted")) try K.prompted(a, io, o, id) else id;
+    const gibs = struct {
+        fn bytes(g: f64) u64 {
+            return @intFromFloat(g * (1 << 30));
+        }
+    }.bytes;
+    const rules = @import("cuda_snaps.zig").passRules(F, @import("cuda_startup.zig").rows(F, loaded));
+    var opts: rows.Options = .{
+        .root = root,
+        .identity = key,
+        .cap = gibs(o.learn_gib),
+        .floor = gibs(o.learn_min_free_gib),
+        .daily = gibs(o.learn_daily_gib),
+        .lookahead = rules.lookahead,
+        .planned = @hasDecl(F, "share_grid"),
+        .grid = if (@hasDecl(F, "share_grid")) F.share_grid else 0,
+        .spill = o.spill,
+    };
+    if (staging) |bytes| opts.staging_bytes = bytes;
+    const copies: api.prompt_cache.Snapshots = .{ .ptr = loaded.target, .vtable = &@import("cuda_snaps.zig").Snaps(F, &K.image).vtable };
+    const r = try rows.Rows.open(gpa, copies, opts);
+    r.prefill_rate = p.rate;
+    std.log.info("{s}: shared-page conversation states on disk in {s} ({d} states, {d} MiB of {d} MiB)", .{ F.model_type, r.dir, r.states.items.len, r.held() >> 20, r.cap >> 20 });
+    return r;
+}
 /// Kept states through disk module `K` (keptDisk): the same store under the identity its probe and facts give.
 pub fn attachKept(comptime K: type, name: []const u8, a: Allocator, io: std.Io, ctx: *const cuda.Context, o: api.Open, root: []const u8, kernels: ?[]const u8, loaded: anytype, store: *api.prompt_cache.Store) !void {
     // a module that opens the store itself (several ranks' parts, say) declares attach, and takes identityOf from here
     if (comptime @hasDecl(K, "attach")) return K.attach(a, io, ctx, o, root, kernels, loaded, store) else {
         if (@hasDecl(K, "bind")) K.bind(loaded.target, ctx); // the context the store's copies make current
+        if (o.rank > 0) return; // follower TP ranks replay via followLoop; rank 0 owns the disk store
         const p = try K.probe(a, io, loaded.backend, loaded.target);
         const staging = stagingOf(K, loaded.target);
         const id = try keptKey(K, a, io, ctx, o.dir, kernels, loaded.target, p.hash, .{ .family = name, .backend = "cuda" });

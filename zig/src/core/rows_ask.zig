@@ -60,9 +60,9 @@ pub const Ask = struct {
 /// A host's side of disk states: the asks waiting for its engine thread, and when the engine last went quiet.
 pub const Disk = struct {
     asks: std.ArrayList(*Ask) = .empty,
+    rows: ?*rows.Rows = null, // standalone disk store when `TF_KV_SHARE` replaces `pc.Store`
     seen: u64 = 0, // the host's admissions when the writer last looked: a new one restarts the quiet
     since: ?i96 = null,
-
     /// The quiet after the last admission before the first write: a client's next turn often comes sooner.
     pub const quiet_ns: i96 = 150 * std.time.ns_per_ms;
 
@@ -94,5 +94,6 @@ pub const Disk = struct {
     pub fn close(d: *Disk, gpa: std.mem.Allocator) void {
         for (d.asks.items) |a| a.answer(null, .{});
         d.asks.deinit(gpa);
+        d.rows = null;
     }
 };

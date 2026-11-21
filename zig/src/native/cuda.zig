@@ -8,6 +8,7 @@ const lanes = @import("lanes");
 const nemotron = @import("nemotron");
 const family_memory = @import("cuda_family_memory.zig");
 const pool = family_memory.pool;
+const page_drop = @import("cuda_page_drop.zig");
 const family_options = @import("cuda_options.zig");
 pub const follow = @import("cuda_follow.zig").follow;
 const lfm2 = @import("lfm2.zig");
@@ -70,6 +71,7 @@ pub const Host = struct {
     kv_count: ?*@import("core").kv_pool.Pool = null, // the paged pool the lane host's ledger admits (#1943)
     kv_plan: ?@import("cuda_ledger.zig").Plan = null, // the KV ledger's budget and cost, read by the lane host
     prompts: ?*prompt_pages.Adapter = null, // TF_KV_SHARE: the family's prompts as its pool's pages (no `store` then)
+    share_rows: ?*api.prompt_cache.rows.Rows = null, // standalone disk store beside `prompts` under TF_KV_SHARE
     learn: ?api.Learner = null, // the family's Sliding Weights learner (--slide), called with the context current
     slide: ?*anyopaque = null, // that learner's adapter, freed by slide_free before the family
     slide_free: ?*const fn (Allocator, *anyopaque) void = null,
@@ -201,8 +203,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         return null;
     };
     if (raised.window != null and window > own) std.log.info("{s}", .{try windows.pastTrained(a, window, own, raised.switch_name)});
-    if (o.slide) {
-        // a family learns once its module declares `slide` (its learner), `learnModel` and `linked`
+    if (o.slide) { // a family learns once its module declares `slide` (its learner), `learnModel` and `linked`
         if (!@hasDecl(F, "slide")) {
             problem.* = try std.fmt.allocPrint(a, "--slide: {s} checkpoints do not learn on CUDA yet", .{o.model_type});
             return null;
@@ -262,6 +263,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
             return null;
         },
     };
+    if ((try g.ctx.attribute(.integrated)) != 0) _ = page_drop.drop(a, io, o.dir); // GB10: drop cached shards (#1857)
     const before = try pool(a, io, &g.ctx, problem) orelse return null;
     // a family split over hosts holds only its rank's share (GLM-5.3-Flash's TP)
     const weights = try family_memory.weights(F, a, io, o, problem) orelse return null;
@@ -333,7 +335,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         return null;
     }
     const share = try prompt_pages.wanted(F, loaded); // TF_KV_SHARE: the cache is pool pages, kept by the family's store
-    if (o.learn_conversations and share) {
+    if (o.learn_conversations and share and !cuda_disk.supportsShareDisk(F)) {
         problem.* = "--learn-conversations writes the host prompt cache's states, and TF_KV_SHARE keeps prompts as pool pages instead: serve with one of the two";
         return null;
     }
@@ -375,8 +377,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     errdefer gpa.destroy(h);
     h.* = .{ .gpa = gpa, .gpu = g, .family = loaded.ctx, .release = loaded.deinit, .inner = served.backend, .served = served, .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined, .lone = if (@hasField(L, "lone")) loaded.lone else null };
     h.readiness(F);
-    h.kv_plan = counted.ledger;
-    // a ledger's plan placed the cache already, beside --parallel full-window requests
+    h.kv_plan = counted.ledger; // a ledger's plan placed the cache already, beside --parallel full-window requests
     const kept = if (host_cache) kv_pages.kept(F, loaded, paged, o, room, held, final_host_budget, true) else if (counted.ledger) |lp| lp.kept else kv_pages.kept(F, loaded, paged, o, room, held, 0, false);
     if (h.kv_plan) |*lp| lp.kept = kept;
     const cache = kept.copied;
@@ -413,8 +414,12 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     }
     errdefer if (h.store) |store| kv_pages.closeStore(gpa, store);
     const share_limit = if (!share) 0 else if (counted.slots != null) paged.?.snaps else try @import("core").kv_prompts.sharing(); // what its slots hold
+    if (share and o.learn_conversations and comptime cuda_disk.supportsShareDisk(F)) if (o.learn) |root| {
+        h.share_rows = try cuda_disk.openShareDisk(F, gpa, a, io, &g.ctx, o, root, kernels, loaded);
+    };
+    errdefer if (h.share_rows) |r| r.deinit();
     if (comptime @hasDecl(F, "share_attach")) if (@import("cuda_streams.zig").opensStore(F, share, cache, share_limit)) {
-        h.prompts = try prompt_pages.Adapter.open(F, gpa, loaded.target, @intCast(layout.?.page_tokens), share_limit);
+        h.prompts = try prompt_pages.Adapter.openWithDisk(F, gpa, loaded.target, @intCast(layout.?.page_tokens), share_limit, h.share_rows);
     };
     errdefer if (h.prompts) |x| x.close();
     var conversations = false;
@@ -495,6 +500,7 @@ test {
     _ = windows;
     _ = @import("cuda_startup_test.zig");
     _ = budget; // cuda_memory.zig's own tests, which no other test binary reaches
+    _ = page_drop;
     _ = refusals;
     _ = lane_backend;
     _ = snaps;

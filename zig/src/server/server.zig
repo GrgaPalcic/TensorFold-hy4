@@ -224,22 +224,17 @@ pub const Server = struct {
         };
         const a = srv.arena.allocator();
         srv.eos = try a.dupe(u32, text.eosIds());
-        if (text.tokenId(reply_text.channel_markers.close) != null) srv.markers = reply_text.channel_markers;
-        const minimax = text.tokenId(reply_text.mm_markers.close) != null;
-        if (minimax) srv.markers = reply_text.mm_markers;
-        srv.close_id = text.tokenId(srv.markers.close);
         const source = text.templateSource();
+        try @import("tool_hy4.zig").initServerMarkers(srv, a, source, text);
+        srv.close_id = text.tokenId(srv.markers.close);
         srv.effort_levels = try fields.effortLevels(a, source);
-        // MiniMax-M3's template decides on its own; thinking off closes the block in the prompt (prompt.zig)
-        srv.thinking_switch = minimax or std.mem.indexOf(u8, source, "enable_thinking") != null or
-            std.mem.indexOf(u8, source, "thinking_mode") != null;
         srv.late_system = try lateSystem(a, text);
         srv.needs_user_after_tool = needsUserAfterTool(source);
         if (srv.info.vision != null) {
             const template_images = templateImages(srv);
             if (!template_images) log.line("warning: --vision: the chat template writes no image placeholder for an image part, so image requests will fail; serve with --chat-template naming a template that has an image path", .{});
         }
-        if (text.tokenId(if (minimax) reply_text.mm_markers.close else "</think>")) |end| {
+        if (text.tokenId(if (reply_text.isChannel(srv.markers)) "</think>" else srv.markers.close)) |end| {
             const lead = try text.encode(a, "\n", false);
             const trail = try text.encode(a, "\n\n", false);
             srv.think_close = try std.mem.concat(a, u32, &.{ lead, &.{end}, trail });

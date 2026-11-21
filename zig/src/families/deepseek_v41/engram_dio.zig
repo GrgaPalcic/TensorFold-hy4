@@ -13,9 +13,9 @@ pub fn pread(fd: linux.fd_t, buf: [*]u8, len: usize, off: i64) usize {
     return linux.pread(fd, buf, len, off);
 }
 
-/// `fd`, opened O_DIRECT, kept direct if it reads a sector at a sector; refused (EINVAL), O_DIRECT is cleared on it.
-pub fn direct(fd: linux.fd_t, buf: []align(4096) u8) !bool {
-    while (true) switch (linux.errno(pread(fd, buf.ptr, sector, sector))) {
+/// `fd`, opened O_DIRECT, kept direct if it reads `unit` bytes at `unit`; refused (EINVAL), O_DIRECT is cleared.
+pub fn directAt(fd: linux.fd_t, buf: []align(4096) u8, unit: u64) !bool {
+    while (true) switch (linux.errno(pread(fd, buf.ptr, @intCast(unit), @intCast(unit)))) {
         .INTR => continue,
         .INVAL => break,
         // bytes, the end of the file or an I/O error: the reads that follow report their own
@@ -26,4 +26,9 @@ pub fn direct(fd: linux.fd_t, buf: []align(4096) u8) !bool {
     const flag: usize = @as(u32, @bitCast(linux.O{ .DIRECT = true }));
     if (linux.errno(linux.fcntl(fd, linux.F.SETFL, flags & ~flag)) != .SUCCESS) return error.EngramReadFailed;
     return false;
+}
+
+/// `fd`, opened O_DIRECT, kept direct if it reads a sector at a sector; refused (EINVAL), O_DIRECT is cleared on it.
+pub fn direct(fd: linux.fd_t, buf: []align(4096) u8) !bool {
+    return directAt(fd, buf, sector);
 }

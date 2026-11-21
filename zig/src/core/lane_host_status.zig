@@ -95,6 +95,12 @@ pub fn noteLive(h: *LaneHost) void {
             h.cache_status.?.states = s.entries.items.len; // /metrics reads these every round, as before
             h.cache_status.?.bytes = s.held + s.spare();
         }
+    } else if (h.disk.rows) |r| {
+        h.cache_status = null;
+        if (h.disk_status == null or now_ms - h.cache_at >= 1000) {
+            h.disk_status = snap.DiskRows(r);
+            h.cache_at = now_ms;
+        }
     } else {
         h.cache_status = null;
         h.disk_status = null;

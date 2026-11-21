@@ -26,6 +26,7 @@ fn chooseAt(s: *const pc.Store, prompt: []const u32, starts: []const u32, spans:
     var out: Choice = .{};
     var best_saved: f64 = 0;
     for (r.states.items, 0..) |*state, i| {
+        if (state.unreadable) continue;
         if (before) |at| if (state.at >= at) continue;
         if (r.blankBytes(state.at) > room) continue;
         if (!r.matches(state, prompt, starts, spans)) continue;
@@ -45,6 +46,28 @@ fn chooseAt(s: *const pc.Store, prompt: []const u32, starts: []const u32, spans:
         out.read_seconds = readSeconds(r, i) orelse 0;
     }
     if (out.restore) |i| {
+        out.disk = i;
+        out.read_seconds = readSeconds(r, i) orelse 0;
+    }
+    return out;
+}
+
+/// Selects the best NVMe state for a paged `TF_KV_SHARE` store within `avail_pages` (`before`: strict upper bound).
+pub fn choosePages(r: *const rows.Rows, prompt: []const u32, starts: []const u32, from: u32, avail_pages: usize, ctx: *anyopaque, needed: *const fn (*anyopaque, u32) usize, before: ?u32) Choice {
+    var out: Choice = .{};
+    var best_saved: f64 = 0;
+    for (r.states.items, 0..) |*state, i| {
+        if (state.unreadable) continue;
+        if (before) |at| if (state.at >= at) continue;
+        if (state.at <= from) continue;
+        if (needed(ctx, state.at) > avail_pages) continue;
+        if (!r.matches(state, prompt, starts, &.{})) continue;
+        if (savedSeconds(r, i, from)) |saved| {
+            if (!(saved > 0)) continue;
+            if (out.restore != null and (saved < best_saved or (saved == best_saved and state.at <= r.states.items[out.restore.?].at))) continue;
+            best_saved = saved;
+        } else if (out.restore != null and state.at <= r.states.items[out.restore.?].at) continue;
+        out.restore = i;
         out.disk = i;
         out.read_seconds = readSeconds(r, i) orelse 0;
     }

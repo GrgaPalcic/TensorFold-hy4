@@ -1,3 +1,52 @@
+# TensorFold-hy4: Native W8A16 CUDA Hy4-flash-FP8 on NVIDIA DGX Spark (GB10)
+
+An explicit fork of [ashhart/TensorFold](https://github.com/ashhart/TensorFold) (branched from Release `1.2.10`, commit `2a674b552`), co-authored by [@GrgaPalcic](https://github.com/GrgaPalcic) and [@popay97](https://github.com/popay97). Everything below the divider is upstream TensorFold's README, unchanged.
+
+Upstream TensorFold added Metal Hy4-flash in `1.3.1` and merged an EXL3 CUDA text path (`#4259`, landing `shantanugoel`'s `#4004`). This fork implements the **full checkpoint-precision (W8A16) CUDA path** for `tencent/Hy4-flash-FP8` (~220B total / ~12B active MoE) across 2× and 4× NVIDIA DGX Spark (`sm_121`, GB10), with native `--vision`, `1M` context (`--kv-cache fp8`), unified `256`-token paged `TF_KV_SHARE` + NVMe recall, and switchless 4-Spark `200GbE` CX7 ring collectives.
+
+Full architecture, kernel contracts, launch flags, and measured receipts live in **[`docs/recipes/hy4-flash.md`](docs/recipes/hy4-flash.md)**.
+
+## What is upstream's, and what this fork adds
+
+- **Upstream TensorFold (`2a674b552`, `v1.2.10`)**: core native Zig + CUDA engine (`lanes`, `server`, `kv_pool`, `kv_ledger`, `prompt_cache`, `core/picture`, `xgrammar`, base `fp8`/`qmmf`/`experts`/`vit`/`sample` CUDA infrastructure by [Ash Hart](https://github.com/ashhart) and contributors); `TF_KV_SHARE` & `prompt_radix` ([Bizuayeu](https://github.com/Bizuayeu), [Jürgen Schmied](https://github.com/jschmied), [laudney](https://github.com/laudney)); DeepSeek-V4.1 `O_DIRECT` + `io_uring` Engram reader ([Ash Hart](https://github.com/ashhart)) plus Metal Engram & shard discovery ([Kevin Gilbertson](https://github.com/gilby), [Jay Leaton](https://github.com/jayleaton)); and `fabric/tp` RoCE transport ([Neko Legends](https://github.com/neko-legends)).
+- **Added in this fork (`202` files, `+34,439 / -706` lines, every module `< 600` lines)**:
+  - **Native W8A16 `hy_v4_flash` family**: 42-layer absorbed gated MLA with learned sinks (12 indexed + 30 sliding-window layers), 4-stream iHC, LatentMoE (512 routed / 16 active + shared), 61.5 GiB (63.4B-param) FP8 Engram packing & hash dispatch, 4:1 pooled sparse indexer, built-in 5-layer `DFly2` speculative drafter + dense/sparse CUDA Graphs, `HYTK` tools, and `xgrammar` `vtable.held` draft hook.
+  - **Blackwell `sm_121` CUDA kernel stack**: `K=64` 3-stage `sm_120+` 1D TMA full-grid MoE prompt kernel (`-68.3 ms/4K`), 2-CTA/SM low-spill FP32-exact absorbed MLA (`47.75 KiB` / `48,896 B` SMEM, `-71.3 ms/4K`, plus `_paged`), `sk=1`-pinned FP8 projections (`247–265 GB/s`, up to `97%` of GB10's `273 GB/s` DRAM roof), batched multi-stream `sm_90+` PDL indexer (`+25%` `c8` `DFly2` rounds/s), 1-collective BF16 GPU sampling (`sample.cu`), and hybrid `io_uring` decode + lazy bulk-pool `O_DIRECT` Engram prefill (`0.01 ms` GPU wait gap for `344 ms` of `4K`-chunk SSD reads).
+  - **Native `--vision` & `1M` context**: rank-0 27-layer SigLIP ViT + PatchMerger + 3D interleaved M-RoPE (`0.87 GiB`, `cos = 1.00000` vs PyTorch `fp32`), lossless 32-row indexer tail ring (`-13.6%` KV bytes, `0` bit diffs), and opt-in selective `--kv-cache fp8` (`8,644 B/tok`, `-48.8%` vs stock BF16; `98.2%` greedy top-1 match, `+0.90%` PPL).
+  - **Unified `256`-token paged KV pool & NVMe recall**: 13 `_paged` CUDA kernels wiring Hy4 into TensorFold's `TF_KV_SHARE`, piecewise `256 MiB` NVMe write-behind (`core/prompt_radix_disk.zig`, `hy4/cuda_disk_pages.zig`), and multi-rank ring `ncclBroadcast` recall (`24 ms` SSD read / `0.70 s` 4-rank e2e, `0`-bit drift).
+  - **Switchless 4-Spark `200GbE` CX7 ring collectives** (`cuda_tp.zig`): ring `ncclBroadcast`, ring `ncclAllGather` + `tf_rank_sum`, and `tp_roce` mailbox relay without a network switch.
+  - **Live `sm_121` hardware contracts**: `90` 5-SM `nvcc 13.0` Gate 5 launch-bound records, `50/50` planted red controls caught, `9/9` `hy4-invariance` `0`-bit checks (`world ∈ {1, 2, 4}`), and `156/156` `alone` + `54/54` `serial` parity on both `TP=2` and `TP=4`.
+
+## Measured results on NVIDIA DGX Spark (GB10, `sm_121`)
+
+All `8`-stream decode numbers below are measured across **distinct prompts / diverging trajectories** (zero identical-prompt MoE collapse):
+
+| Setup (`tencent/Hy4-flash-FP8`, W8A16) | 1-Stream `DFly2` (TTFT) | 8 Distinct Streams | Cold `32K` Prefill | Physical Unshared KV Pool (`--kv-cache fp8`) |
+|---|---:|---:|---:|---|
+| **`2× DGX Spark`** (`TP=2`, direct `200GbE`, NVMe Engram) | **`43.6 tok/s`** (`0.141 s`) | **`90.0–107.9 tok/s`** (`92.2` prose) | **`2,090 tok/s`** | **`2.79M–3.18M` tok** (`2–3 × 1M` unshared; `8 × 816K` = `6.53M` shared-prefix in `7.6 GiB`, `16/16` recall) |
+| **`4× DGX Spark`** (`TP=4`, switchless `200GbE` ring, NVMe Engram) | **`55.7 tok/s`** (`0.099 s`) | **`118.1` prose / `141.5` chat** | **`1,946 tok/s`** | **`7.63M` tok** (`29,790` pages: `7 × 1M` or `8 × 953K` unshared) |
+| **`4× DGX Spark`** (`TP=4`, switchless `200GbE` ring, RAM Engram) | **`58.0 tok/s`** (`0.093 s`) | **`123.5 tok/s`** prose | **`1,945 tok/s`** | **`5.74M` tok** (`22,414` pages: `5 × 1M` or `8 × 717K` unshared) |
+
+## Quick build & serve
+
+```sh
+# 1. Prebuild sm_121 kernel fatbins + tp_mailbox.fatbin once
+zig build fatbins -Dnvcc=/usr/local/cuda/bin/nvcc -Dsm=121
+
+# 2. Build ReleaseFast native server
+zig build native -Dgpu=spark -Dfatbins=/path/to/fatbins -Doptimize=ReleaseFast
+```
+
+Set `TF_TP_KERNEL_IMAGE=/path/to/fatbins/tp_mailbox.fatbin`, `TF_KV_SHARE=32`, `TENSORFOLD_MEMORY_RESERVE_GIB=8`, and your `200GbE` CX7 `NCCL_*` / `TF_TP_ROCE_*` variables, then launch with `--precision full --context 1048576 --parallel 8 --kv-cache fp8 --vision --learn-conversations`. Full step-by-step flags, Engram packing, and contract test commands are in **[`docs/recipes/hy4-flash.md`](docs/recipes/hy4-flash.md)**.
+
+## Known limits
+
+- `--kv-cache fp8` is opt-in (`bf16` is default): `98.2%` (`214/218`) greedy top-1 match and `+0.90%` PPL (`KL = 0.0089` nats) vs `bf16` KV.
+- Refused by name: video parts, images without `--vision`, external `--drafter`, non-checkpoint quantizations, and world sizes other than `1`, `2`, or `4`.
+- Non-`sm_121` CUDA architectures (`sm_80`, `sm_89`, `sm_90a`, `sm_120a`) are compiled and Gate-5 checked with `nvcc 13.0`, but live serving benchmarks were run only on GB10 (`sm_121`).
+
+---
+
 <p align="center">
   <a href="https://ko-fi.com/ashxhart">Help Support TensorFold</a> ·
   <a href="https://x.com/tensorfold_dev">@tensorfold_dev on X</a>

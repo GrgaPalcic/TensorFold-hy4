@@ -6,6 +6,8 @@ const reply_code = @import("reply_code.zig");
 const reply_text = @import("reply_text.zig");
 const tool_dsml = @import("tool_dsml.zig");
 const tool_dsml_stream = @import("tool_dsml_stream.zig");
+const tool_hy4 = @import("tool_hy4.zig");
+const tool_hy4_stream = @import("tool_hy4_stream.zig");
 const tool_glm_cut = @import("tool_glm_cut.zig");
 const tool_json_cut = @import("tool_json_cut.zig");
 const tool_glm_stream = @import("tool_glm_stream.zig");
@@ -53,7 +55,7 @@ pub const Streamer = struct {
     typed: bool = false,
     buffer: std.ArrayList(u8) = .empty,
     pos: usize = 0,
-    state: enum { outside, call, buffered, function, value, closing, glm, dsml, abort } = .outside,
+    state: enum { outside, call, buffered, function, value, closing, glm, dsml, hy4, abort } = .outside,
     index: i64 = -1,
     args_open: bool = false,
     lead: bool = false,
@@ -69,6 +71,7 @@ pub const Streamer = struct {
     buffered_close: []const u8 = "",
     glm: tool_glm_stream.Glm = .{},
     dsml: tool_dsml_stream.Dsml = .{},
+    hy4: tool_hy4_stream.Stream = .{},
     code: reply_code.Scanner = .{},
     finished: bool = false,
 
@@ -178,6 +181,19 @@ pub const Streamer = struct {
                             s.state = .dsml;
                             break;
                         }
+                        if (tool_hy4.openedBy(text[start..])) |op| switch (op) {
+                            .wait => {
+                                s.searched = start;
+                                return;
+                            },
+                            .open => |h| {
+                                s.dsml_seen = true;
+                                s.hy4 = tool_hy4_stream.Stream.initFrom(h, start);
+                                s.pos = start + h.open_len;
+                                s.state = .hy4;
+                                break;
+                            },
+                        };
                         if (std.mem.startsWith(u8, text[start..], "<tool_call>")) {
                             s.buffered_start = start;
                             s.pos = start + "<tool_call>".len;
@@ -251,6 +267,10 @@ pub const Streamer = struct {
                 },
                 .dsml => {
                     if (!try s.dsmlStep(text, out)) return;
+                    continue;
+                },
+                .hy4 => {
+                    if (!try s.hy4Step(text, out)) return;
                     continue;
                 },
                 .buffered => {
@@ -331,6 +351,7 @@ pub const Streamer = struct {
     /// A call that the reply's end left open: its name streamed, its envelope not closed.
     pub fn open(s: *const Streamer) bool {
         if (s.state == .dsml) return s.dsml.sent > 0; // the block's whole parse would keep it all as text
+        if (s.state == .hy4) return s.hy4.sent > 0;
         return s.index >= 0 and (s.state == .glm or s.state == .function or s.state == .value or s.state == .closing);
     }
 
@@ -375,6 +396,28 @@ pub const Streamer = struct {
         }
     }
 
+    /// One Hy4 state-machine step: prose passes through, rejected blocks parse whole at their closer.
+    fn hy4Step(s: *Streamer, text: []const u8, out: *std.ArrayList(Value)) Allocator.Error!bool {
+        switch (try tool_hy4_stream.feed(s, text, out)) {
+            .wait => return false,
+            .outside => return true,
+            .prose => {
+                s.pos = s.hy4.start + s.hy4.open_len;
+                s.state = .outside;
+                return true;
+            },
+            .rejected => {
+                s.dsml_start = s.hy4.start;
+                s.dsml_close = try s.hy4.blockClose(s.a, text);
+                s.pos = s.hy4.start + s.hy4.open_len;
+                s.dsml_searched = s.pos;
+                s.state = .outside;
+                return true;
+            },
+            .more => unreachable,
+        }
+    }
+
     /// ``feed`` at the reply's end: resolves any open backtick ambiguity without cutting open values.
     pub fn finish(s: *Streamer, text: []const u8, out: *std.ArrayList(Value)) Allocator.Error!void {
         s.finished = true;
@@ -386,6 +429,7 @@ pub const Streamer = struct {
         try s.finish(text, out);
         if (s.state == .glm) return tool_glm_stream.cut(s, text, out); // a GLM value's held bytes
         if (s.state == .dsml) return tool_dsml_stream.cut(s, text, out); // a DSML value's held bytes
+        if (s.state == .hy4) return tool_hy4_stream.cut(s, text, out); // a Hy4 value's held bytes
         if (s.state != .value) return;
         var cut = try std.mem.concat(s.a, u8, &.{ if (s.typed) s.buffer.items else "", s.held, text[@min(s.pos, text.len)..] });
         if (s.lead and cut.len > 0 and cut[0] == '\n') cut = cut[1..];
@@ -409,8 +453,8 @@ pub fn cutCalls(a: Allocator, text: []const u8, tools: []const Value) Allocator.
     var s: Streamer = try .init(a, tools);
     var deltas: std.ArrayList(Value) = .empty;
     try s.finishCut(text, &deltas);
-    // GLM and JSON envelopes stream no call before they close
-    if (!s.open()) return (try tool_glm_cut.cutCalls(a, text, tools)) orelse try tool_json_cut.cutCalls(a, text, tools);
+    // GLM, Hy4 and JSON envelopes that streamed no call before the cut still close here
+    if (!s.open()) return (try tool_hy4.cutCalls(a, text, tools)) orelse (try tool_glm_cut.cutCalls(a, text, tools)) orelse try tool_json_cut.cutCalls(a, text, tools);
     const Call = struct { id: []const u8 = "", name: []const u8 = "", args: std.ArrayList(u8) = .empty };
     const built = try a.alloc(Call, @intCast(s.index + 1));
     for (built) |*c| c.* = .{};

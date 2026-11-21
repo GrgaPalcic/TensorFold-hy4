@@ -45,7 +45,11 @@ struct Tile {
     static constexpr int S = MODE == FP4 || MODE == FP8G ? BN * 4 : MODE == MXFP8 ? BN * 2 : 0;
     static constexpr int STAGE = (X + W + S + 127) / 128 * 128;
     static constexpr int PARTIALS = MT * NT * 4 * THREADS * 4;
-    static constexpr int BARRIERS = MODE == BF16 && BN > 64 ? 128 : 0;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+    static constexpr int BARRIERS = (MODE == BF16 || MODE == FP8G) ? 128 : 0;
+#else
+    static constexpr int BARRIERS = 0;
+#endif
     static constexpr int SMEM = (STAGES * STAGE > PARTIALS ? STAGES * STAGE : PARTIALS) + BARRIERS;
 };
 
@@ -208,6 +212,27 @@ BF16_PROMPT(false, true)
 BF16_PROMPT(true, false)
 BF16_PROMPT(true, true)
 #undef BF16_PROMPT
+
+#define FP8G_PROMPT(F32, FUSE) \
+    template __global__ void qmmf_kernel<FP8G, 128, 128, 2, 4, 3, F32, false, FUSE>( \
+        const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, \
+        void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+FP8G_PROMPT(false, false)
+FP8G_PROMPT(false, true)
+FP8G_PROMPT(true, false)
+FP8G_PROMPT(true, true)
+#undef FP8G_PROMPT
+
+// 2-CTA/SM FP8G prompt tile (64x128, 4 warps, 2 stages = 33,920 B SMEM): bit-identical K64 chain to 128x128.
+#define FP8G_PROMPT64(F32, FUSE) \
+    template __global__ void qmmf_kernel<FP8G, 64, 128, 1, 4, 2, F32, false, FUSE>( \
+        const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, \
+        void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+FP8G_PROMPT64(false, false)
+FP8G_PROMPT64(false, true)
+FP8G_PROMPT64(true, false)
+FP8G_PROMPT64(true, true)
+#undef FP8G_PROMPT64
 
 // Unsplit K32 needs no inter-slice partial buffer or bulk-copy barrier storage.
 struct PromptK32Tile {

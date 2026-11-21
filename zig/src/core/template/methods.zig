@@ -301,6 +301,7 @@ fn strMethod(rt: *Rt, s: v.Str, name: []const u8, pos: []const Value, kw: []cons
         if (name[6] == 'p') return .{ .str = try s.part(rt.a, if (std.mem.startsWith(u8, t, x)) t[x.len..] else t) };
         return .{ .str = try s.part(rt.a, if (x.len > 0 and std.mem.endsWith(u8, t, x)) t[0 .. t.len - x.len] else t) };
     }
+    if (eq(u8, name, "format")) return format(rt, s, pos, kw);
     if (eq(u8, name, "join")) {
         const b = try bind(rt, "join", &.{"iterable"}, 1, pos, kw);
         var out: v.Buffer = .{};
@@ -312,6 +313,64 @@ fn strMethod(rt: *Rt, s: v.Str, name: []const u8, pos: []const Value, kw: []cons
         return .{ .str = out.str() };
     }
     return rt.fail("str.{s}() is not supported", .{name});
+}
+
+/// Python's str.format with plain fields ({}, {0}, {name}, !s, !r, {{ and }}); format specs and lookups are refused.
+fn format(rt: *Rt, s: v.Str, pos: []const Value, kw: []const Kw) Error!Value {
+    const t = s.s;
+    var out: v.Buffer = .{};
+    var next: usize = 0; // the next automatic field's index
+    var mode: enum { none, auto, manual } = .none;
+    var lit: usize = 0;
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        const c = t[i];
+        if (c != '{' and c != '}') continue;
+        if (i + 1 < t.len and t[i + 1] == c) { // a doubled brace is the brace itself
+            try out.append(rt.a, try s.part(rt.a, t[lit .. i + 1]));
+            i += 1;
+            lit = i + 1;
+            continue;
+        }
+        if (c == '}') return rt.fail("Single '}}' encountered in format string", .{});
+        const close = std.mem.indexOfScalarPos(u8, t, i + 1, '}') orelse return rt.fail("expected '}}' before end of string", .{});
+        const field = t[i + 1 .. close];
+        try out.append(rt.a, try s.part(rt.a, t[lit..i]));
+        const name_end = std.mem.indexOfAny(u8, field, "!:") orelse field.len;
+        const name = field[0..name_end];
+        var conv: u8 = 's';
+        var rest = field[name_end..];
+        if (rest.len > 0 and rest[0] == '!') {
+            if (rest.len < 2 or (rest.len > 2 and rest[2] != ':')) return rt.fail("expected ':' after conversion specifier", .{});
+            conv = rest[1];
+            rest = rest[2..];
+        }
+        if (rest.len > 1) return rt.fail("str.format() format specs are not supported", .{});
+        if (std.mem.indexOfAny(u8, field, "{.[") != null) return rt.fail("str.format() nested fields, attributes and indexes are not supported", .{});
+        const x: Value = if (name.len == 0) blk: {
+            if (mode == .manual) return rt.fail("cannot switch from manual field specification to automatic field numbering", .{});
+            mode = .auto;
+            next += 1;
+            if (next > pos.len) return rt.fail("Replacement index {d} out of range for positional args tuple", .{next - 1});
+            break :blk pos[next - 1];
+        } else if (std.fmt.parseInt(usize, name, 10)) |n| blk: {
+            if (mode == .auto) return rt.fail("cannot switch from automatic field numbering to manual field specification", .{});
+            mode = .manual;
+            if (n >= pos.len) return rt.fail("Replacement index {d} out of range for positional args tuple", .{n});
+            break :blk pos[n];
+        } else |_| for (kw) |k| {
+            if (std.mem.eql(u8, k.name, name)) break k.value;
+        } else return rt.fail("'{s}'", .{name});
+        try out.append(rt.a, switch (conv) {
+            's' => try v.asStr(rt, x),
+            'r' => try v.Str.derived(rt.a, try v.repr(rt, x), v.hasRequest(x)),
+            else => return rt.fail("Unknown conversion specifier {c}", .{conv}),
+        });
+        i = close;
+        lit = close + 1;
+    }
+    try out.append(rt.a, try s.part(rt.a, t[lit..]));
+    return .{ .str = out.str() };
 }
 
 fn dictMethod(rt: *Rt, d: *const v.Dict, self: Value, name: []const u8, pos: []const Value, kw: []const Kw) Error!Value {

@@ -34,6 +34,10 @@ pub const Adapter = struct {
 
     /// The family's store, its pool's reclaim evicting the tree's idle pages; null: the family has no pool.
     pub fn open(comptime F: type, gpa: Allocator, target: anytype, page_tokens: u32, snap_limit: usize) !?*Adapter {
+        return openWithDisk(F, gpa, target, page_tokens, snap_limit, null);
+    }
+
+    pub fn openWithDisk(comptime F: type, gpa: Allocator, target: anytype, page_tokens: u32, snap_limit: usize, disk: ?*api.prompt_cache.rows.Rows) !?*Adapter {
         const pool = F.share_pool(target) orelse return null;
         const x = try gpa.create(Adapter);
         errdefer gpa.destroy(x);
@@ -50,6 +54,9 @@ pub const Adapter = struct {
         errdefer x.store.deinit();
         x.store.limit(.{ .pages = pool.total(), .snaps = snap_limit });
         try pool.joinReclaim(.{ .ctx = x, .call = reclaim }); // a promise or a hold evicts the tree's idle pages first
+        if (comptime @hasDecl(F, "share_disk")) if (disk) |r| {
+            _ = try api.prompt_radix_disk.Bridge.attach(gpa, &x.store, r, F.share_disk(target));
+        };
         F.share_attach(target, .{ .ctx = x, .vtable = &vtable });
         return x;
     }

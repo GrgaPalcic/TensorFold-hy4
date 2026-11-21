@@ -6,6 +6,7 @@ const reply_code = @import("reply_code.zig");
 const reply_text = @import("reply_text.zig");
 const tool_closers = @import("tool_closers.zig");
 const tool_dsml = @import("tool_dsml.zig");
+const tool_hy4 = @import("tool_hy4.zig");
 const tool_params = @import("tool_params.zig");
 const tool_specs = @import("tool_specs.zig");
 const tool_streaming = @import("tool_streaming.zig");
@@ -71,6 +72,7 @@ pub fn envelopes(a: Allocator, text: []const u8) Allocator.Error![]Envelope {
                 const end = e orelse text.len;
                 break :blk .{ .start = s, .end = end, .payload = text[s..end], .complete = e != null };
             }
+            if (tool_hy4.envelopeAt(text, s)) |h| break :blk .{ .start = h.start, .end = h.end, .payload = h.payload, .complete = h.complete };
             if (!no_tc and std.ascii.startsWithIgnoreCase(text[s..], "<tool_call>")) {
                 if (findCI(text, "</tool_call>", s + 11)) |e| {
                     break :blk .{ .start = s, .end = e + 12, .payload = strip(text[s + 11 .. e]) };
@@ -134,6 +136,10 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
                     error.Invalid => null,
                 };
             }
+            if (tool_hy4.whole(env.payload)) |b| break :blk tool_hy4.calls(a, b, &schemas) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Invalid => null,
+            };
             const one = payload(a, env.payload, &schemas, max_calls != null) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Invalid => break :blk null,
@@ -188,6 +194,7 @@ fn keepName(a: Allocator, names: *std.ArrayList([]const u8), raw: []const u8) Al
 
 /// What closes the call ``text`` ends inside (the model's end token came before its ``
 pub fn closeCall(a: Allocator, text: []const u8, tools: []const Value) Allocator.Error![]const u8 {
+    if (try tool_hy4.closeCall(a, text, tools)) |hy| return hy;
     const start = openCall(text) orelse return "";
     const block = text[start + 11 ..];
     const tail = try argumentsClose(a, strip(block));

@@ -112,7 +112,7 @@ pub const Store = struct {
     legacy: bool = true,
     /// No checkpoint at all (pure full attention): any matched page edge resumes, and no entry is kept.
     page_only: bool = false,
-
+    disk: ?*@import("prompt_radix_disk.zig").Bridge = null,
     const SHARED_KEYS = 64;
 
     pub fn init(gpa: Allocator, family: Snapshots, pages: Pages, rules: Rules) !Store {
@@ -137,7 +137,7 @@ pub const Store = struct {
     }
 
     /// Page ids a logical page: one per prefix group.
-    fn per(s: *const Store) usize {
+    pub fn per(s: *const Store) usize {
         return s.tree.per;
     }
 
@@ -152,11 +152,12 @@ pub const Store = struct {
     }
 
     /// Tokens a resume leaves past its state: the lookahead it read, and at least one to prefill.
-    fn past(s: *const Store) u32 {
+    pub fn past(s: *const Store) u32 {
         return @max(1, s.rules.lookahead);
     }
 
     pub fn deinit(s: *Store) void {
+        if (s.disk) |d| d.deinit();
         s.shared_keys.deinit(s.tree.gpa);
         s.tree.deinit();
     }
@@ -197,7 +198,8 @@ pub const Store = struct {
             return .{ .marks = try a.alloc(u32, 0) };
         }
         if (s.page_only) return s.beginPages(a, q, history_len, shared, adopt);
-        const found = s.find(q);
+        var found = s.find(q);
+        if (s.disk) |d| found = d.recall(s, q, found);
         if (found == null) s.tree.counts.misses += 1;
         const resume_at: u32 = if (found) |n| n.end else 0;
         const planned = try s.marks(a, q, resume_at, history_len, shared, if (found) |n| n.entry.?.last else &.{});
@@ -444,6 +446,7 @@ pub const Store = struct {
         node.entry = .{ .saved = saved, .parts = made, .bytes = bytes, .born = @intCast(prompt.len), .used = t.clock, .last = last, .shared = flagged };
         t.snaps += 1;
         t.counts.kept += 1;
+        if (s.disk) |d| if (saved) |sv| d.kept(s, q, node, sv);
         return .{ .held = true, .shared = mine.len };
     }
 

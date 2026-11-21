@@ -214,9 +214,10 @@ pub fn thinkingFields(cx: *Cx, body: Value, levels: []const []const u8) errors.R
         effort = k.field("reasoning_effort");
     };
     if (effort) |e| {
-        if (e != .string or !isEffort(e.string)) return cx.refuse("reasoning_effort must be none, minimal, low, medium, high, xhigh or max");
-        out.effort = coerceEffort(e.string, levels);
-        out.enable = !std.mem.eql(u8, e.string, "none");
+        if (e != .string or (!isEffort(e.string) and !std.mem.eql(u8, e.string, "no_think"))) return cx.refuse("reasoning_effort must be none, minimal, low, medium, high, xhigh or max");
+        const off = std.mem.eql(u8, e.string, "none") or std.mem.eql(u8, e.string, "no_think");
+        out.effort = if (off) "none" else coerceEffort(e.string, levels);
+        out.enable = !off;
     }
     if (kw_object) if (enable) |on| {
         out.enable = on.truthy();

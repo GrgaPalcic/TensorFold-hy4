@@ -566,6 +566,7 @@ pub const Rounds = @import("lane_host.zig").Rounds;
 pub const prompt_cache = @import("prompt_cache.zig");
 /// The same for a paged cache over the backend's own KV pages (prompt_radix.zig).
 pub const prompt_radix = @import("prompt_radix.zig");
+pub const prompt_radix_disk = @import("prompt_radix_disk.zig");
 /// Decoded prompt rows as canonical spans, for a cache keyed by the arithmetic that made each row (cache_modes.zig).
 pub const cache_modes = @import("cache_modes.zig");
 

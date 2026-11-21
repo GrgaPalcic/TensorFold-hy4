@@ -11,6 +11,8 @@ pub const Switch = enum {
     TF_QWEN_KV_SHARE,
     TF_QWEN_REQUEST_STARTS,
     TF_GLM_REQUEST_STARTS,
+    TF_HY4_REQUEST_STARTS,
+    TF_HY4_KV_PAGES,
     TF_KV_SHARE,
     TF_FLASHNEXT_KV_PAGES,
     TF_FLASHNEXT_KV_PAGES_ALL,
@@ -138,16 +140,17 @@ const nemotron: []const []const u8 = &.{ "nemotron_h", "nemotron_h_omni" };
 const slide_cuda: []const []const u8 = &.{ "nemotron_h", "nemotron_h_omni", "qwen3_5" };
 const flash: []const []const u8 = &.{"qwen4_exp"};
 /// The CUDA families whose host prompt cache the generic CUDA host builds (cuda_keep_others_test.zig checks the list).
-pub const cuda_cache: []const []const u8 = &.{ "nemotron_h", "nemotron_h_omni", "glm5_next", "minimax_m3_vl", "qwen3_5", "qwen3_5_moe", "qwen4_exp", "kolibri1", "gemma4", "gemma4_unified", "spark2_5", "dory", "lfm2_moe" };
+pub const cuda_cache: []const []const u8 = &.{ "nemotron_h", "nemotron_h_omni", "glm5_next", "minimax_m3_vl", "qwen3_5", "qwen3_5_moe", "qwen4_exp", "kolibri1", "gemma4", "gemma4_unified", "spark2_5", "dory", "hy_v4_flash", "lfm2_moe" };
 
 pub const entries = [_]Entry{
     .{ .id = .TF_CACHE_EVICT, .families = cuda_cache, .backend = "multiple", .scopes = &.{ .{ .backend = "cuda", .families = cuda_cache }, .{ .backend = "metal", .families = &.{ "nemotron_h", "qwen3_5", "qwen3_5_moe", "qwen4_exp", "glm5_next", "glm_moe_dsa", "minimax_m3_vl", "gemma4", "gemma4_unified", "spark2_5", "llama", "lfm2_moe", "lfm3", "lfm3_vl", "step5_vl", "kimi_k3", "kimi_k31" } }, .{ .backend = "xpu", .families = &.{ "nemotron_h", "lfm3", "qwen3_5", "gemma4" } } }, .class = .experimental, .syntax = .present, .report_values = &.{"decayed_resume"}, .effect = "Opt into bounded resume credit for RAM snapshot eviction", .evidence = "#3241; synthetic host rows gate; default main unchanged" },
     .{ .id = .TF_QWEN_REQUEST_STARTS, .families = qwen, .class = .arithmetic, .syntax = .one, .effect = "Opt into CUDA message-start prompt cuts", .evidence = "#1334; default-off; GB10 six-turn: resumed equals fresh, one reply differs from unset" },
     .{ .id = .TF_GLM_REQUEST_STARTS, .families = &.{"glm5_next"}, .class = .arithmetic, .syntax = .one, .effect = "Opt into CUDA message-start prompt cuts", .evidence = "#2396; default-off; GB10 TP=2 receipts in #2404" },
+    .{ .id = .TF_HY4_REQUEST_STARTS, .families = &.{"hy_v4_flash"}, .class = .arithmetic, .syntax = .one, .effect = "Opt into CUDA message-start prompt cuts", .evidence = "#14; default-off; GB10 hy4-invariance 0-bit cut-equal" },
     .{ .id = .TF_QWEN_KV_PAGES, .families = qwen, .class = .identical, .effect = "KV pool page size; memory and workload tradeoffs", .evidence = "#1357" },
     .{ .id = .TF_QWEN_KV_PAGES_ALL, .families = qwen, .class = .debug, .syntax = .one, .effect = "Put the engine's own stream on pages too", .evidence = "#1357" },
     .{ .id = .TF_QWEN_KV_SHARE, .families = qwen, .class = .identical, .effect = "Keep prompt pages and bounded recurrent snapshots", .evidence = "#1357" },
-    .{ .id = .TF_KV_SHARE, .families = &.{ "gemma4", "gemma4_unified", "kolibri1", "spark2_5", "glm5_next", "dory" }, .class = .identical, .effect = "Keep prompt states over the core KV pool", .evidence = "#1657" },
+    .{ .id = .TF_KV_SHARE, .families = &.{ "gemma4", "gemma4_unified", "kolibri1", "spark2_5", "glm5_next", "dory", "hy_v4_flash" }, .class = .identical, .effect = "Keep prompt states over the core KV pool", .evidence = "#1657" },
     .{ .id = .TF_FLASHNEXT_KV_PAGES, .families = flash, .class = .experimental, .effect = "KV pool page size; no profile qualifies it yet", .evidence = "#1660" },
     .{ .id = .TF_FLASHNEXT_KV_PAGES_ALL, .families = flash, .class = .debug, .syntax = .one, .effect = "Put every stream on pool pages for checks", .evidence = "#1660" },
     .{ .id = .TF_KV_PAGES, .families = &.{"glm5_next"}, .class = .identical, .syntax = .auto, .effect = "GLM KV pool pages; auto from two ranks with BF16, windows with FP8", .evidence = "#1322" },
@@ -170,6 +173,7 @@ pub const entries = [_]Entry{
     .{ .id = .TENSORFOLD_GEMMA4_KV_PAGES, .families = &.{ "gemma4", "gemma4_unified" }, .class = .identical, .report_values = &.{"0"}, .effect = "Global caches lease pool pages by default; 0 keeps them linear", .evidence = "#1619" },
     .{ .id = .TENSORFOLD_SPARK25_KV_PAGES, .families = &.{"spark2_5"}, .class = .identical, .report_values = &.{"0"}, .effect = "Full caches lease pool pages by default; 0 keeps them linear", .evidence = "#1653" },
     .{ .id = .TENSORFOLD_LFM2_KV_PAGES, .families = &.{"lfm2_moe"}, .class = .identical, .report_values = &.{"0"}, .effect = "Attention caches lease pool pages by default; 0 keeps fixed pages a stream", .evidence = "#1503" },
+    .{ .id = .TF_HY4_KV_PAGES, .families = &.{"hy_v4_flash"}, .class = .identical, .report_values = &.{"0"}, .effect = "Indexed MLA and group keys lease 256-token pool pages by default; 0 keeps them linear", .evidence = "#1657" },
     .{ .id = .TF_NEMOTRON_METAL_KV_PAGES, .families = &.{"nemotron_h"}, .backend = "metal", .class = .identical, .syntax = .one, .effect = "Only exact 1 puts keys and values in the core pool's pages; unset, whole caches made at open", .evidence = "#1537" },
     .{ .id = .TF_QWEN27_METAL_KV_PAGES, .families = &.{"qwen3_5"}, .backend = "metal", .class = .arithmetic, .syntax = .one, .effect = "Only exact 1 puts the 27B's keys and values in core-pool pages; refused on Macs with tensor units", .evidence = "#2370; class until a main-against-branch token-hash run on a Mac without tensor units" },
     .{ .id = .TF_QWEN35_METAL_KV_PAGES, .families = qwen, .backend = "metal", .class = .arithmetic, .syntax = .one, .effect = "Only exact 1 puts the streams' keys and values in core-pool pages; unset, whole caches at load", .evidence = "#2370; class until a main-against-branch token-hash run" },

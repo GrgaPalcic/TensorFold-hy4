@@ -66,6 +66,20 @@ Diagnostics quote and escape the supplied text so it cannot create another termi
 | `TF_DSV41_CALIB_FILE` | DeepSeek-V4.1 on Metal: a cost table file (JSON: `verify`, each window's ms by its rows from 1, and `draft`, the drafter pass's ms) that prices draft depth instead of the built-in table. Measure it on the machine that serves; pricing never changes a token. Unset: the built-in table. |
 | `TF_DSV41_ENGRAM_VERIFY` | DeepSeek-V4.1 on Metal: exactly `sample` or `full`; `full` also checks every byte of the Engram tables against their manifest at boot; default `sample` |
 | `TF_DSV41_ENGRAM_CACHE` | DeepSeek-V4.1 on Metal: whole u32 count of Engram records a layer kept cached; default 65536 |
+| `TF_HY4_ENGRAM_DIR` | Hy4-flash on CUDA: a directory path without control characters holding packed `.hy4e` Engram tables; unset checks `<model>` then `<model>/../hy4-engram` |
+| `TF_HY4_ENGRAM_MODE` | Hy4-flash on CUDA: `nvme` or `resident`; default `nvme` |
+| `TF_HY4_ENGRAM_CACHE` | Hy4-flash on CUDA: whole u32 count of Engram records cached a layer in `nvme` mode; default 16384 |
+| `TF_HY4_LAYERS` | Hy4-flash on CUDA: whole layer count `1` through `42`; unset serves all 42 layers |
+| `TF_HY4_COPIES` | Hy4-flash on CUDA: exactly `0` or `1`; enables or disables copy-draft windows |
+| `TF_HY4_REQUEST_STARTS` | Hy4-flash on CUDA: exactly `0` or `1`; `1` cuts prompt passes at templated message starts for multi-turn snapshot reuse; default off |
+| `TF_HY4_C1_EXACT` | Hy4-flash on CUDA: exactly `0` or `1`; `1` uses 2-plane FP32-exact latent MLA attention (`x16` / `x16_qreg`); default on |
+| `TF_HY4_DFLY` | Hy4-flash on CUDA: exactly `0` or `1`; enables or disables the built-in 5-layer DFly2 speculative drafter when `model.dfly_layers.*` are present; default on |
+| `TF_HY4_DFLY_FP8_HEAD` | Hy4-flash on CUDA: exactly `0` or `1`; packs DFly2's draft-only `lm_head` view as 1x64 `FP8G` (target verification keeps exact `bf16`); default on |
+| `TF_HY4_SHARD_REP` | Hy4-flash on CUDA: exactly `0` or `1`; shards replicated `qkv_a` and `latent_down` (`R <= 64`) across `TP=2` ranks during decode; default on |
+| `TF_HY4_DFLY_GRAPH` | Hy4-flash on CUDA: exactly `0` or `1`; captures dense and sparse (`>= 2048`) DFly2 proposals (`B <= 10`, `n <= 64`) in CUDA Graphs; default on |
+| `TF_HY4_SWA_GRAPH` | Hy4-flash on CUDA: exactly `0` or `1`; captures merged post-attention and sliding-window spans (`R <= 64`) in CUDA Graphs; default on |
+| `TF_HY4_PROF` | Hy4-flash on CUDA: exactly `0` or `1`; enables rank-0 CUDA-event per-op and per-round telemetry; default off |
+| `TF_HY4_KV_PAGES` | Hy4-flash on CUDA: exactly `0` or `1`; leases 256-token KV pool pages for indexed MLA and pooled group keys by default (`0` keeps linear per-stream caches) |
 | `XPU_A8_BITS` | Exactly `4` or `8`, for the XPU quantization study; unset keeps the study's existing setting |
 | `LFM3_FUSE` | Whole u32 fusion mask; default 7 |
 | `TF_SLIDE_POCKET_KEY` | Exactly `auto`, `reply`, `subject` or `both`; default `auto` |

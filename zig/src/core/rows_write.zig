@@ -43,6 +43,14 @@ pub fn queued(r: *Rows, e: *pc.Entry, starts: []const u32) void {
     sync.queued(r, e, starts);
 }
 
+pub fn queuedWithRelease(r: *Rows, e: *pc.Entry, starts: []const u32, release: sync.Release) void {
+    if (r.stopped) {
+        release.call(release.ctx, e);
+        return;
+    }
+    sync.queuedWithRelease(r, e, starts, release);
+}
+
 /// Eviction removes only a save still queued (staged work owns no entry); one that waited for room counts as skipped.
 pub fn dropped(r: *Rows, e: *pc.Entry) void {
     if (r.waiting == e) r.waiting = null;
@@ -86,6 +94,7 @@ pub fn evicted(r: *Rows, e: *pc.Entry) void {
 
 pub fn wanted(r: *const Rows, n: chain.Stem) bool {
     if (r.sync_writes) return sync.wanted(r, n);
+    for (r.queue.items) |q| if (q.partial) return true;
     return if (r.worker) |w| w.wanted(n) else false;
 }
 
@@ -191,6 +200,16 @@ pub fn reap(r: *Rows) void {
 }
 
 fn publish(r: *Rows, j: *io.Job) !void {
+    if (!j.publishes) {
+        try r.blocks.ensureUnusedCapacity(r.gpa, @intCast(j.files.len));
+        for (j.files) |*f| {
+            try f.writer.?.publish();
+            const refs = if (r.blocks.get(chain.stem(f.trailer.name))) |b| b.refs else 0;
+            r.blocks.putAssumeCapacity(chain.stem(f.trailer.name), .{ .bytes = f.bytes, .refs = refs });
+            r.spent(f.bytes);
+        }
+        return;
+    }
     if (r.find(j.name)) |_| return;
     if (!complete(r, j)) return error.MissingBlock;
     var s: store.State = .{ .name = j.name, .at = j.at, .tokens = &.{}, .spans = &.{}, .starts = &.{}, .own = j.files[j.files.len - 1].bytes, .rows = 0, .used = 0, .shared = j.shared };
@@ -238,27 +257,38 @@ fn stage(r: *Rows, q: Queued, may_wait: bool) bool {
     const name = chain.state(r.keying, q.entry.tokens, q.entry.decode_spans, q.starts, at);
     const j = sync.prepare(r, q) catch |err| {
         skip(r, name, at, err);
+        q.finish();
         return true;
-    } orelse return true;
+    } orelse {
+        q.finish();
+        return true;
+    };
     var queued_again = false;
     defer {
-        if (!queued_again) r.gpa.free(j.starts);
+        if (!queued_again) {
+            r.gpa.free(j.starts);
+            q.finish();
+        }
         r.gpa.free(j.parts);
         r.gpa.free(j.wants);
         r.gpa.free(j.own);
         r.gpa.destroy(j);
     }
-    stageJob(r, j, may_wait) catch |err| {
+    const finished = stageJob(r, j, may_wait) catch |err| {
         if (err == error.StagingBusy) {
             queued_again = true;
             r.waiting = q.entry;
-            r.queue.appendAssumeCapacity(.{ .entry = q.entry, .starts = q.starts, .waited = true });
+            r.queue.appendAssumeCapacity(.{ .entry = q.entry, .starts = q.starts, .waited = true, .partial = q.partial, .release = q.release });
             return false;
         }
         skip(r, j.name, at, err);
         if (err == error.GatherFailed or err == error.SnapshotGpuFailure) r.counts.failed += 1;
         return true;
     };
+    if (!finished) {
+        queued_again = true;
+        r.queue.appendAssumeCapacity(.{ .entry = q.entry, .starts = q.starts, .waited = q.waited, .partial = true, .release = q.release });
+    }
     return true;
 }
 
@@ -269,17 +299,20 @@ fn skip(r: *Rows, name: chain.Name, at: u32, err: anyerror) void {
     pc.note("imprint: saving {d} tokens skipped ({s})", .{ at, @errorName(err) });
 }
 
-fn stageJob(r: *Rows, prepared: *const Job, may_wait: bool) !void {
+fn stageJob(r: *Rows, prepared: *const Job, may_wait: bool) !bool {
     if (r.worker == null) r.worker = try io.Worker.open(r.dir, r.staging_bytes, r.file_io);
     const w = r.worker.?;
-    if (w.names(prepared.name)) return;
+    if (w.names(prepared.name)) return true;
     const e = prepared.entry;
     const metadata = 4 * (3 + e.tokens.len + 2 * e.decode_spans.len + prepared.starts.len);
     var promised: io.Promised = .empty;
     defer promised.deinit(r.gpa);
     var count: usize = 0;
+    var publishes = true;
+    var max_blocks: usize = prepared.wants.len;
+    const piece_lim = if (may_wait and prepared.release != null) w.limit else std.math.maxInt(u64);
     try w.promised(r.gpa, &promised);
-    var bytes = newBytes(r, &promised, prepared, metadata, &count);
+    var bytes = newBytesSlice(r, &promised, prepared, metadata, &count, &publishes, &max_blocks, piece_lim);
     var charge: u64 = 0;
     while (true) {
         charge = charged(bytes, count, prepared.wants.len);
@@ -287,13 +320,18 @@ fn stageJob(r: *Rows, prepared: *const Job, may_wait: bool) !void {
         const reserved = w.reserved();
         if (!r.budget(bytes + reserved)) return error.DailyBudgetSpent;
         if (!r.room(bytes + reserved)) return error.OverCap;
-        try w.promised(r.gpa, &promised); // a fence inside room frees the blocks cancelled jobs promised
+        try w.promised(r.gpa, &promised);
         var again_count: usize = 0;
-        const again = newBytes(r, &promised, prepared, metadata, &again_count);
-        if (again == bytes) break;
+        var again_pub = true;
+        var again_max: usize = prepared.wants.len;
+        const again = newBytesSlice(r, &promised, prepared, metadata, &again_count, &again_pub, &again_max, piece_lim);
+        if (again == bytes and again_pub == publishes and again_max == max_blocks) break;
         bytes = again;
         count = again_count;
+        publishes = again_pub;
+        max_blocks = again_max;
     }
+    if (count == 0) return error.StagingFull;
     if (r.admission.reserve(r.dir, bytes) != .ready) return error.UnderFreeDiskFloor;
     errdefer r.admission.finish(r.dir, bytes, true);
     const j = try io.allocator.create(io.Job);
@@ -303,7 +341,8 @@ fn stageJob(r: *Rows, prepared: *const Job, may_wait: bool) !void {
     const a = arena.allocator();
     const files = try a.alloc(io.File, count);
     var built: usize = 0;
-    for (prepared.wants) |want| if (lacks(r, &promised, want)) {
+    const block_goal = if (publishes) count - 1 else count;
+    for (prepared.wants) |want| if (built < block_goal and lacks(r, &promised, want)) {
         var ranges: std.ArrayList(image.Range) = .empty;
         defer ranges.deinit(r.gpa);
         try image.blockRanges(prepared.parts, r.keying.block, want.window, want.k, &ranges, r.gpa);
@@ -311,18 +350,24 @@ fn stageJob(r: *Rows, prepared: *const Job, may_wait: bool) !void {
         try r.img.gather(r.family.ptr, e.saved, ranges.items, files[built].payload);
         built += 1;
     };
-    const own = &files[built];
-    own.* = .{ .trailer = .{ .kind = @backingInt(file.Kind.state), .payload = 0, .payload_hash = 0, .name = prepared.name, .at = e.at, .block = r.keying.block, .flags = @intFromBool(e.shared) }, .payload = try a.alloc(u8, @intCast(image.total(prepared.own))) };
-    if (own.payload.len > 0) try r.img.gather(r.family.ptr, e.saved, prepared.own, own.payload);
-    const tokens = try a.dupe(u32, e.tokens);
-    const spans = try a.dupe(@import("cache_modes.zig").Span, e.decode_spans);
-    const starts = try a.dupe(u32, prepared.starts);
-    const counts = try a.create([3]u32);
-    counts.* = .{ @intCast(tokens.len), @intCast(spans.len), @intCast(starts.len) };
-    own.meta = try a.dupe([]const u8, &.{ std.mem.asBytes(counts), std.mem.sliceAsBytes(tokens), std.mem.sliceAsBytes(spans), std.mem.sliceAsBytes(starts) });
+    var tokens: []u32 = &.{};
+    var spans: []@import("cache_modes.zig").Span = &.{};
+    var starts: []u32 = &.{};
+    if (publishes) {
+        const own = &files[built];
+        own.* = .{ .trailer = .{ .kind = @backingInt(file.Kind.state), .payload = 0, .payload_hash = 0, .name = prepared.name, .at = e.at, .block = r.keying.block, .flags = @intFromBool(e.shared) }, .payload = try a.alloc(u8, @intCast(image.total(prepared.own))) };
+        if (own.payload.len > 0) try r.img.gather(r.family.ptr, e.saved, prepared.own, own.payload);
+        tokens = try a.dupe(u32, e.tokens);
+        spans = try a.dupe(@import("cache_modes.zig").Span, e.decode_spans);
+        starts = try a.dupe(u32, prepared.starts);
+        const counts = try a.create([3]u32);
+        counts.* = .{ @intCast(tokens.len), @intCast(spans.len), @intCast(starts.len) };
+        own.meta = try a.dupe([]const u8, &.{ std.mem.asBytes(counts), std.mem.sliceAsBytes(tokens), std.mem.sliceAsBytes(spans), std.mem.sliceAsBytes(starts) });
+    }
     const wants = try a.dupe(Want, prepared.wants);
-    j.* = .{ .arena = arena, .id = r.next_job, .generation = w.generation.load(.acquire), .name = prepared.name, .at = e.at, .shared = e.shared, .tokens = tokens, .spans = spans, .starts = starts, .wants = wants, .files = files, .bytes = bytes, .staged = charge, .verify = r.verify, .began = prepared.began };
+    j.* = .{ .arena = arena, .id = r.next_job, .generation = w.generation.load(.acquire), .name = prepared.name, .at = e.at, .shared = e.shared, .tokens = tokens, .spans = spans, .starts = starts, .wants = wants, .files = files, .bytes = bytes, .staged = charge, .verify = r.verify, .publishes = publishes, .began = prepared.began };
     w.submit(j);
+    return publishes;
 }
 
 /// A staged job's charge: its files' bytes and the bookkeeping the worker holds beside them.
@@ -351,14 +396,32 @@ fn lacks(r: *const Rows, promised: *const io.Promised, want: Want) bool {
     return !r.blocks.contains(n) and !promised.contains(n);
 }
 
-fn newBytes(r: *const Rows, promised: *const io.Promised, j: *const Job, metadata: usize, count: *usize) u64 {
-    var bytes = image.total(j.own) + metadata + @sizeOf(file.Trailer);
-    count.* = 1;
+fn newBytesSlice(r: *const Rows, promised: *const io.Promised, j: *const Job, metadata: usize, count: *usize, publishes: *bool, max_blocks: *usize, limit: u64) u64 {
+    const own_bytes = image.total(j.own) + metadata + @sizeOf(file.Trailer);
+    var full = own_bytes;
+    var full_cnt: usize = 1;
     for (j.wants) |want| if (lacks(r, promised, want)) {
-        bytes += want.bytes;
-        count.* += 1;
+        full += want.bytes;
+        full_cnt += 1;
     };
-    return bytes;
+    if (charged(full, full_cnt, j.wants.len) <= limit or full_cnt == 1) {
+        count.* = full_cnt;
+        publishes.* = true;
+        max_blocks.* = full_cnt - 1;
+        return full;
+    }
+    publishes.* = false;
+    var part: u64 = 0;
+    var n: usize = 0;
+    for (j.wants) |want| if (lacks(r, promised, want)) {
+        const next_bytes = part + want.bytes;
+        if (n > 0 and charged(next_bytes, n + 1, j.wants.len) > limit) break;
+        part = next_bytes;
+        n += 1;
+    };
+    count.* = n;
+    max_blocks.* = n;
+    return part;
 }
 
 // Times a write took, in milliseconds: the last, the smoothed and the histogram, and the wall time it landed.

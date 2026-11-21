@@ -42,7 +42,7 @@ pub const Layer = struct {
 pub const Epi = enum { up, down_f32, down_bf16 };
 
 /// The rows in: bf16 `x` rows `stride` apart; `up` reads token rows (`slots` pairs a row), down reads pair rows.
-pub const Rows = struct { x: u64, stride: usize, slots: usize = 0 };
+pub const Rows = struct { x: u64, stride: usize, slots: usize = 0, contig_act: bool = false };
 
 /// The kernels of every format a family loaded; a layer whose format is not loaded is refused.
 pub const Grouped = struct {
@@ -253,17 +253,31 @@ pub const Fp8Experts = struct {
     mod: Module,
     fns: [2][3]Function, // decode, prompt; by Epi
     resident: [2][3]usize, // blocks the grid may hold: per SM times SMs
+    tma_up: ?Function = null,
+    tma_dn_s3: ?Function = null,
+    tma_dn_s2: ?Function = null,
+    tma_dn_bf16: ?Function = null,
+    k64: [3]?Function = .{ null, null, null },
+    k64_resident: [3]usize = .{ 0, 0, 0 },
 
     pub const cols = 32; // output columns a warp
     pub const block = 128; // the checkpoint's scale block, both ways
+    pub const k64_smem: u32 = 49176; // 3 stages * (2*2*64*16 W + 64*8*16 X) + 24 B sm_120+ mbarriers
 
     pub const symbols = struct {
         pub const gate_up = "_ZN14tf_fp8_experts17fp8_expert_kernelILi2ELi2ELi4EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_Pvifi";
         pub const down_f32 = "_ZN14tf_fp8_experts17fp8_expert_kernelILi1ELi0ELi4EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_Pvifi";
         pub const down_bf16 = "_ZN14tf_fp8_experts17fp8_expert_kernelILi1ELi3ELi4EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_Pvifi";
+        pub const tma_up = "_ZN14tf_fp8_experts21fp8_expert_tma_kernelILi2ELi2ELi2ELi4EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_Pvifi";
+        pub const tma_dn_s3 = "_ZN14tf_fp8_experts21fp8_expert_tma_kernelILi1ELi0ELi3ELi4EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_Pvifi";
+        pub const tma_dn_s2 = "_ZN14tf_fp8_experts21fp8_expert_tma_kernelILi1ELi0ELi2ELi4EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_Pvifi";
+        pub const tma_dn_bf16 = "_ZN14tf_fp8_experts21fp8_expert_tma_kernelILi1ELi3ELi2ELi4EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_Pvifi";
         pub const p_gate_up = "_ZN14tf_fp8_experts24fp8_expert_prompt_kernelILi2ELi2ELi2ELi2EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_Pvifi";
         pub const p_down_f32 = "_ZN14tf_fp8_experts24fp8_expert_prompt_kernelILi1ELi0ELi4ELi4EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_Pvifi";
         pub const p_down_bf16 = "_ZN14tf_fp8_experts24fp8_expert_prompt_kernelILi1ELi3ELi4ELi4EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_Pvifi";
+        pub const p_k64_up = "_ZN14tf_fp8_experts28fp8_expert_prompt_k64_kernelILi2ELi2ELi2ELi2ELb0ELb1EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_Pvifi";
+        pub const p_k64_dn_f32 = "_ZN14tf_fp8_experts28fp8_expert_prompt_k64_kernelILi1ELi0ELi4ELi4ELb1ELb0EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_Pvifi";
+        pub const p_k64_dn_bf16 = "_ZN14tf_fp8_experts28fp8_expert_prompt_k64_kernelILi1ELi3ELi4ELi4ELb1ELb0EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_Pvifi";
     };
 
     pub fn load(d: *const Driver, sms: usize) !Fp8Experts {
@@ -276,6 +290,19 @@ pub const Fp8Experts = struct {
             e.fns[i][j] = try mod.function(name);
             e.resident[i][j] = @max(1, try e.fns[i][j].occupancy(128, 0)) * sms;
         };
+        e.tma_up = mod.function(symbols.tma_up) catch null;
+        e.tma_dn_s3 = mod.function(symbols.tma_dn_s3) catch null;
+        e.tma_dn_s2 = mod.function(symbols.tma_dn_s2) catch null;
+        e.tma_dn_bf16 = mod.function(symbols.tma_dn_bf16) catch null;
+        const k64_names = [3][:0]const u8{ symbols.p_k64_up, symbols.p_k64_dn_f32, symbols.p_k64_dn_bf16 };
+        for (k64_names, 0..) |name, j| {
+            if (mod.function(name)) |f| {
+                if (f.allowDynamicShared(k64_smem)) |_| {
+                    e.k64[j] = f;
+                    e.k64_resident[j] = @max(1, f.occupancy(128, k64_smem) catch 1) * sms;
+                } else |_| {}
+            } else |_| {}
+        }
         return e;
     }
 
@@ -289,10 +316,7 @@ pub const Fp8Experts = struct {
         const kg = (if (gate) l.dims else l.width) / 32;
         const nb = (if (gate) l.width else l.dims) / cols;
         const n = if (gate) l.width else l.dims;
-        const pi: usize = @intFromBool(prompt);
-        const ei: usize = @backingInt(epi);
-        const grid: usize = if (prompt) @min(items * (nb / @as(usize, if (gate) 2 else 4)), e.resident[pi][ei]) else @min((items * nb + 3) / 4, e.resident[pi][ei]);
-        if (grid < 1) return;
+        if (items == 0 or nb == 0) return;
         var a: launch_.Args = .{};
         a.add(in.x);
         a.add(@as(i32, @intCast(in.stride)));
@@ -305,6 +329,30 @@ pub const Fp8Experts = struct {
         a.add(@as(i32, @intCast(n)));
         a.add(if (gate) l.limit else @as(f32, 0.0));
         a.add(skip);
+        if (!prompt and kg % 4 == 0) {
+            const tma_fn: ?Function = switch (epi) {
+                .up => if (items > 16) e.tma_up else null,
+                .down_f32 => if (items <= 16) e.tma_dn_s3 else e.tma_dn_s2,
+                .down_bf16 => e.tma_dn_bf16,
+            };
+            if (tma_fn) |f| {
+                try launch_.launch(f, .{ .grid = .{ .x = @intCast(items * nb), .y = 1, .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s, &a);
+                return;
+            }
+        }
+        const ei: usize = @backingInt(epi);
+        if (prompt and in.contig_act and kg % 4 == 0) {
+            if (e.k64[ei]) |f| {
+                // Full grid keeps same-expert items lockstep in L2 (resident grids drift across experts).
+                const grid: usize = items * (nb / @as(usize, if (gate) 2 else 4));
+                if (grid < 1) return;
+                try launch_.launch(f, .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 128, .y = 1, .z = 1 }, .shared = k64_smem }, s, &a);
+                return;
+            }
+        }
+        const pi: usize = @intFromBool(prompt);
+        const grid: usize = if (prompt) @min(items * (nb / @as(usize, if (gate) 2 else 4)), e.resident[pi][ei]) else @min((items * nb + 3) / 4, e.resident[pi][ei]);
+        if (grid < 1) return;
         try launch_.launch(e.fns[pi][ei], .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &a);
     }
 
@@ -515,74 +563,6 @@ pub const Nvfp4Experts = struct {
         };
     }
 };
-
-test "a packed nvfp4 block puts each nibble and scale where nvfp4/experts.py's _pack does" {
-    const gpa = std.testing.allocator;
-    const n = 64;
-    const k = 64;
-    const codes = try gpa.alloc(u8, n * k / 2);
-    defer gpa.free(codes);
-    for (codes, 0..) |*c, i| c.* = @truncate(i * 29 + 3);
-    var scales: [n * k / 16]u8 = undefined;
-    for (&scales, 0..) |*c, i| c.* = @truncate(i * 7 + 1);
-    var out: [n / 32 * (k / 32) * Nvfp4Experts.words]u32 = undefined;
-    Nvfp4Experts.packOne(&out, codes, &scales, n, k);
-    const words = Nvfp4Experts.words;
-    // block (cb 1, g 1), lane gq 3, t 2, tile j 1: row 32 + 8 + 3 = 43; input 32 + 16 + 8 + 3 (h 1, q 3) -> slot 7
-    const w = out[(1 * 2 + 1) * words + (3 * 4 + 2) * 4 + 1];
-    try std.testing.expectEqual(@as(u32, codes[43 * 32 + 59 / 2] >> 4), (w >> Nvfp4Experts.slot(1, 3)) & 0xF);
-    // its scale byte (t 2, h 1, j 1, c 0): row 32 + 8 + 4 = 44, k16 group 3
-    const sc = std.mem.sliceAsBytes(out[(1 * 2 + 1) * words + 128 ..][0..16]);
-    try std.testing.expectEqual(scales[44 * 4 + 3], sc[((2 * 2 + 1) * 4 + 1) * 2]);
-}
-
-test "packGateUp stacks packOne's gate and up blocks per (column block, k32 group)" {
-    const n = 64;
-    const k = 64;
-    const words = Nvfp4Experts.words;
-    var codes: [2][n * k / 2]u8 = undefined;
-    var scales: [2][n * k / 16]u8 = undefined;
-    for (0..2) |m| {
-        for (&codes[m], 0..) |*c, i| c.* = @truncate(i * 29 + 3 + m * 101);
-        for (&scales[m], 0..) |*c, i| c.* = @truncate(i * 7 + 1 + m * 13);
-    }
-    var one: [2][n / 32 * (k / 32) * words]u32 = undefined;
-    for (0..2) |m| Nvfp4Experts.packOne(&one[m], &codes[m], &scales[m], n, k);
-    var both: [2 * one[0].len]u32 = undefined;
-    Nvfp4Experts.packGateUp(&both, .{ &codes[0], &scales[0] }, .{ &codes[1], &scales[1] }, n, k);
-    for (0..one[0].len / words) |b| for (0..2) |m| {
-        try std.testing.expectEqualSlices(u32, one[m][b * words ..][0..words], both[(2 * b + m) * words ..][0..words]);
-    };
-}
-
-test "nvfp4 rows of either kind are refused when the format is not loaded" {
-    const g: Grouped = .{};
-    const l: Layer = .{ .format = .nvfp4, .up = 0, .down = 0, .width = 64, .dims = 64, .experts = 2, .relu2 = true };
-    const s: Stream = undefined; // never reached: the refusal comes first
-    const p: Plan = .{ .members = 0, .items = 0, .counts = 0, .rank = 0, .hist = 0 };
-    try std.testing.expectError(error.FormatNotLoaded, g.prompt(s, .up, .{ .x = 0, .stride = 64 }, l, p, 0, 1, 1, 64, -1));
-    try std.testing.expectError(error.FormatNotLoaded, g.decode(s, .down_bf16, .{ .x = 0, .stride = 64 }, l, p, 0, 1, 1, 16, -1));
-    try std.testing.expectEqual(@as(usize, 2 * 2 * 3 * 144 * 4), Nvfp4Experts.bytes(2, 64, 96, 1));
-    try std.testing.expectEqual(@as(u32, 2 * 17408), Nvfp4Experts.promptSmem(1, 8)); // 64 rows x 64 inputs, 8 x 2 blocks
-    try std.testing.expectEqual(@as(u32, 2 * 17408), Nvfp4Experts.promptSmem(2, 4));
-    try std.testing.expectEqual(@as(u32, 3 * 12800), Nvfp4Experts.promptSmem(1, 4));
-}
-
-test "a packed fp8 expert puts each word where fp8/experts.py's pack does" {
-    const gpa = std.testing.allocator;
-    const n = 128;
-    const k = 128;
-    const w = try gpa.alloc(u8, n * k);
-    defer gpa.free(w);
-    for (w, 0..) |*b, i| b.* = @truncate(i * 31 + 7);
-    const out = try gpa.alloc(u32, n * k / 4);
-    defer gpa.free(out);
-    Fp8Experts.packOne(out, w, n, k);
-    // (cb 1, g 2, gq 5, t 3, h 1, j 2): row 32 + 16 + 5 = 53, word 2 * 8 + 4 + 3 = 23
-    const idx = (((((1 * 4 + 2) * 8 + 5) * 4 + 3) * 2 + 1) * 4) + 2;
-    const words = std.mem.bytesAsSlice(u32, @as([]align(1) const u8, w));
-    try std.testing.expectEqual(words[53 * (k / 4) + 23], out[idx]);
-}
 
 test {
     _ = @import("experts_host_test.zig"); // Grouped's refusals before any launch

@@ -14,6 +14,15 @@ constexpr int PER_SCALE = 4;
 
 __device__ __forceinline__ uint4 ld_nc(const uint4* p) { return tf_common::ld_nc(p); }
 
+__device__ __forceinline__ void mma0(float (&d)[4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                                     uint32_t b0, uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+      "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {0f00000000, 0f00000000, 0f00000000, 0f00000000};\n"
+      : "=f"(d[0]), "=f"(d[1]), "=f"(d[2]), "=f"(d[3])
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
 using tf_common::fp8pair;
 
 template <int M>
@@ -49,7 +58,11 @@ __device__ __forceinline__ void compute_stage(float (&part)[M][NTW][4], const St
 #pragma unroll
       for (int j = 0; j < NTW; ++j) {
         const uint32_t word = comp(st.w[m][h], j);
+#if TF_FP_NATIVE
+        mma(part[m][j], a0, a1, a2, a3, tf_common::e4m3x2(word), tf_common::e4m3x2(word >> 16));
+#else
         mma(part[m][j], a0, a1, a2, a3, fp8pair(word), fp8pair(word >> 16));
+#endif
       }
     }
 }
@@ -126,6 +139,152 @@ __global__ void __launch_bounds__(WARPS * 32)
   }
 }
 
+// Blackwell TMA 1D bulk decode kernel (`WARPS=1`, `KCHUNK=4` contiguous k32 groups per TMA load).
+template <int M, int EPI, int STAGES, int KCHUNK>
+__global__ void __launch_bounds__(32)
+    fp8_expert_tma_kernel(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
+                          const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
+                          const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out,
+                          int N, float limit, int skip) {
+  const int unit = blockIdx.x;
+  const int units = __ldg(counts) * NB;
+  if (unit >= units) return;
+  const int lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
+  const int SG = KG / PER_SCALE, NR = (NB * COLS) / 128;
+  const int it = unit / NB, cb = unit - it * NB;
+  const int e = __ldg(items + 3 * it), first = __ldg(items + 3 * it + 1), cnt = __ldg(items + 3 * it + 2);
+  if (e == skip || cnt <= 0) return;
+  const uint4* blk = W + ((size_t)e * NB + cb) * (size_t)KG * (M * BLOCK4);
+  const float* sc = scale + ((size_t)e * M * NR + (cb * COLS) / 128) * SG;
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+  constexpr int BYTES = KCHUNK * M * BLOCK4 * 16;
+  __shared__ __align__(128) uint4 sw[STAGES][KCHUNK][M][BLOCK4];
+  __shared__ __align__(8) uint64_t bar[STAGES];
+  const int nchunks = KG / KCHUNK;
+
+  if (lane == 0) {
+#pragma unroll
+    for (int s = 0; s < STAGES; ++s)
+      asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" :: "r"(tf_common::smem(bar + s)) : "memory");
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+  }
+  __syncwarp();
+
+  int global_step = 0;
+  auto issue_tma = [&](int st, const uint4* src) {
+    if (lane == 0) {
+      const uint32_t b = tf_common::smem(bar + st);
+      asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+      asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" :: "r"(b), "r"(BYTES) : "memory");
+      asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                   :: "r"(tf_common::smem(&sw[st][0][0][0])), "l"(src), "r"(BYTES), "r"(b) : "memory");
+    }
+  };
+  auto wait_tma = [&](int st, int phase) {
+    const uint32_t b = tf_common::smem(bar + st);
+    asm volatile(
+        "{ .reg .pred done; WAIT: mbarrier.try_wait.parity.shared::cta.b64 done, [%0], %1; @!done bra WAIT; }"
+        :: "r"(b), "r"(phase) : "memory");
+  };
+
+  for (int r0 = 0; r0 < cnt; r0 += 16) {
+    const bool v0 = r0 + gq < cnt, v1 = r0 + gq + 8 < cnt;
+    const int pr0 = v0 ? __ldg(members + first + r0 + gq) : 0;
+    const int pr1 = v1 ? __ldg(members + first + r0 + gq + 8) : 0;
+    const __nv_bfloat16* x0 = X + (size_t)(slots ? pr0 / slots : pr0) * x_stride;
+    const __nv_bfloat16* x1 = X + (size_t)(slots ? pr1 / slots : pr1) * x_stride;
+
+    const int base_step = global_step;
+#pragma unroll
+    for (int c = 0; c < STAGES - 1; ++c) {
+      if (c < nchunks) issue_tma((base_step + c) % STAGES, blk + (size_t)(c * KCHUNK) * (M * BLOCK4));
+    }
+
+    float acc[M][1][NTW][4];
+    float part[M][NTW][4];
+#pragma unroll
+    for (int m = 0; m < M; ++m)
+#pragma unroll
+      for (int j = 0; j < NTW; ++j) acc[m][0][j][0] = acc[m][0][j][1] = acc[m][0][j][2] = acc[m][0][j][3] = 0.f;
+
+    const uint2 zero = make_uint2(0u, 0u);
+    for (int c = 0; c < nchunks; ++c) {
+      const int step = base_step + c;
+      const int st = step % STAGES;
+      const int phase = (step / STAGES) & 1;
+      wait_tma(st, phase);
+      __syncwarp();
+      if (c + STAGES - 1 < nchunks) {
+        issue_tma((step + STAGES - 1) % STAGES, blk + (size_t)((c + STAGES - 1) * KCHUNK) * (M * BLOCK4));
+      }
+#pragma unroll
+      for (int kc = 0; kc < KCHUNK; ++kc) {
+        const int g = c * KCHUNK + kc;
+        const int k0 = g * 32 + 4 * t;
+        uint2 xa[2], xb[2];
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          xa[h] = v0 ? __ldg(reinterpret_cast<const uint2*>(x0 + k0 + 16 * h)) : zero;
+          xb[h] = v1 ? __ldg(reinterpret_cast<const uint2*>(x1 + k0 + 16 * h)) : zero;
+        }
+#pragma unroll
+        for (int m = 0; m < M; ++m) {
+#pragma unroll
+          for (int h = 0; h < 2; ++h) {
+            const uint4 wv = sw[st][kc][m][lane * LANE4 + h];
+            const uint32_t a0 = xa[h].x, a2 = xa[h].y, a1 = xb[h].x, a3 = xb[h].y;
+#pragma unroll
+            for (int j = 0; j < NTW; ++j) {
+              const uint32_t word = comp(wv, j);
+#if TF_FP_NATIVE
+              const uint32_t b0 = tf_common::e4m3x2(word), b1 = tf_common::e4m3x2(word >> 16);
+#else
+              const uint32_t b0 = fp8pair(word), b1 = fp8pair(word >> 16);
+#endif
+              if ((KCHUNK == PER_SCALE) ? (kc == 0 && h == 0) : (g % PER_SCALE == 0 && h == 0))
+                mma0(part[m][j], a0, a1, a2, a3, b0, b1);
+              else
+                mma(part[m][j], a0, a1, a2, a3, b0, b1);
+            }
+          }
+        }
+        if ((KCHUNK == PER_SCALE) ? (kc == PER_SCALE - 1) : (g % PER_SCALE == PER_SCALE - 1)) {
+          const int sg = g / PER_SCALE;
+#pragma unroll
+          for (int m = 0; m < M; ++m) {
+            const float s = __ldg(sc + m * NR * SG + sg);
+#pragma unroll
+            for (int j = 0; j < NTW; ++j)
+#pragma unroll
+              for (int q = 0; q < 4; ++q) acc[m][0][j][q] = fmaf(part[m][j][q], s, acc[m][0][j][q]);
+          }
+        }
+      }
+      __syncwarp();
+    }
+    global_step += nchunks;
+    epilogue<EPI, M, 1>(acc, 0, out, N, cb * COLS + 2 * t, pr0, pr1, v0, v1, limit);
+  }
+#else
+  for (int r0 = 0; r0 < cnt; r0 += 16) {
+    const bool v0 = r0 + gq < cnt, v1 = r0 + gq + 8 < cnt;
+    const int pr0 = v0 ? __ldg(members + first + r0 + gq) : 0;
+    const int pr1 = v1 ? __ldg(members + first + r0 + gq + 8) : 0;
+    const int x0r = slots ? pr0 / slots : pr0, x1r = slots ? pr1 / slots : pr1;
+    const __nv_bfloat16* x0 = X + (size_t)x0r * x_stride;
+    const __nv_bfloat16* x1 = X + (size_t)x1r * x_stride;
+    float acc[M][1][NTW][4];
+#pragma unroll
+    for (int m = 0; m < M; ++m)
+#pragma unroll
+      for (int j = 0; j < NTW; ++j) acc[m][0][j][0] = acc[m][0][j][1] = acc[m][0][j][2] = acc[m][0][j][3] = 0.f;
+    k_loop<M>(acc, blk, sc, KG, lane, t, x0, x1, v0, v1, NR * SG);
+    epilogue<EPI, M, 1>(acc, 0, out, N, cb * COLS + 2 * t, pr0, pr1, v0, v1, limit);
+  }
+#endif
+}
+
 constexpr int PWARPS = 4, PSTAGES = 4, PMIN = 1;
 
 template <int M, int RT, int CW>
@@ -140,7 +299,6 @@ __global__ void __launch_bounds__(PWARPS * 32, PMIN)
                              const uint4* __restrict__ W, const float* __restrict__ scale, int KG, int NB,
                              const int* __restrict__ items, const int* __restrict__ counts,
                              const int* __restrict__ members, void* __restrict__ out, int N, float limit, int skip) {
-  constexpr int RW = PromptCfg<M, RT, CW>::RW;
   __shared__ uint4 sw[PSTAGES][CW][M * BLOCK4];
   __shared__ uint4 sx[PSTAGES][64][4];
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
@@ -165,18 +323,22 @@ __global__ void __launch_bounds__(PWARPS * 32, PMIN)
       pr1[r] = v1[r] ? __ldg(members + first + r0 + gq + 8) : 0;
     }
     const __nv_bfloat16* xrow[2];
+    int xdst_r[2], xdst_c[2];
 #pragma unroll
     for (int c = 0; c < 2; ++c) {
-      const int p = min((threadIdx.x + c * PWARPS * 32) / 4, cnt - 1);
+      const int idx = threadIdx.x + c * PWARPS * 32;
+      const int r = idx >> 2, ch = idx & 3;
+      const int p = min(r, cnt - 1);
       const int pr = __ldg(members + first + p);
-      xrow[c] = X + (size_t)(slots ? pr / slots : pr) * x_stride + ((threadIdx.x + c * PWARPS * 32) % 4) * 8;
+      xrow[c] = X + (size_t)(slots ? pr / slots : pr) * x_stride + ch * 8;
+      xdst_r[c] = r;
+      xdst_c[c] = ch ^ ((r >> 1) & 3);
     }
     const uint4* base = W + ((size_t)e * NB + cg * CW) * (size_t)KG * (M * BLOCK4);
     auto stage = [&](int g) {
 #pragma unroll
       for (int c = 0; c < 2; ++c) {
-        const int i = threadIdx.x + c * PWARPS * 32;
-        cp16(&sx[g % PSTAGES][i / 4][i % 4], xrow[c] + g * 32);
+        cp16(&sx[g % PSTAGES][xdst_r[c]][xdst_c[c]], xrow[c] + g * 32);
       }
       for (int i = threadIdx.x; i < CW * M * BLOCK4; i += PWARPS * 32) {
         const int c = i / (M * BLOCK4), j = i % (M * BLOCK4);
@@ -198,50 +360,52 @@ __global__ void __launch_bounds__(PWARPS * 32, PMIN)
 #pragma unroll
         for (int j = 0; j < NTW; ++j) acc[m][r][j][0] = acc[m][r][j][1] = acc[m][r][j][2] = acc[m][r][j][3] = 0.f;
     const bool live = rw * RT * 16 < cnt;
-    for (int g = 0; g < KG; ++g) {
-      cp_wait<PSTAGES - 2>();
-      __syncthreads();
-      if (g + PSTAGES - 1 < KG) stage(g + PSTAGES - 1);
-      cp_commit();
-      if (!live) continue;
-      if (g % PER_SCALE == 0) {
+    for (int sg = 0; sg < SG; ++sg) {
 #pragma unroll
-        for (int m = 0; m < M; ++m)
+      for (int ksub = 0; ksub < PER_SCALE; ++ksub) {
+        const int g = sg * PER_SCALE + ksub;
+        cp_wait<PSTAGES - 2>();
+        __syncthreads();
+        if (g + PSTAGES - 1 < KG) stage(g + PSTAGES - 1);
+        cp_commit();
+        if (!live) continue;
 #pragma unroll
-          for (int r = 0; r < RT; ++r)
+        for (int h = 0; h < 2; ++h) {
+          uint2 xa[RT], xb[RT];
+          const int u = 4 * h + t;
+          const int ch = u >> 1, sub = u & 1;
 #pragma unroll
-            for (int j = 0; j < NTW; ++j)
-              part[m][r][j][0] = part[m][r][j][1] = part[m][r][j][2] = part[m][r][j][3] = 0.f;
-      }
+          for (int r = 0; r < RT; ++r) {
+            const int r0 = (rw * RT + r) * 16 + gq;
+            xa[r] = reinterpret_cast<const uint2*>(&sx[g % PSTAGES][r0][ch ^ ((r0 >> 1) & 3)])[sub];
+            xb[r] = reinterpret_cast<const uint2*>(&sx[g % PSTAGES][r0 + 8][ch ^ (((r0 + 8) >> 1) & 3)])[sub];
+          }
 #pragma unroll
-      for (int h = 0; h < 2; ++h) {
-        uint2 xa[RT], xb[RT];
+          for (int m = 0; m < M; ++m) {
+            const uint4 wv = sw[g % PSTAGES][cw][m * BLOCK4 + lane * LANE4 + h];
 #pragma unroll
-        for (int r = 0; r < RT; ++r) {
-          const int r0 = (rw * RT + r) * 16 + gq;
-          xa[r] = reinterpret_cast<const uint2*>(&sx[g % PSTAGES][r0][0])[4 * h + t];
-          xb[r] = reinterpret_cast<const uint2*>(&sx[g % PSTAGES][r0 + 8][0])[4 * h + t];
-        }
-#pragma unroll
-        for (int m = 0; m < M; ++m) {
-          const uint4 wv = sw[g % PSTAGES][cw][m * BLOCK4 + lane * LANE4 + h];
-#pragma unroll
-          for (int j = 0; j < NTW; ++j) {
-            const uint32_t word = comp(wv, j);
+            for (int j = 0; j < NTW; ++j) {
+              const uint32_t word = comp(wv, j);
 #if TF_FP_NATIVE
-            const uint32_t b0 = tf_common::e4m3x2(word), b1 = tf_common::e4m3x2(word >> 16);
+              const uint32_t b0 = tf_common::e4m3x2(word), b1 = tf_common::e4m3x2(word >> 16);
 #else
-            const uint32_t b0 = fp8pair(word), b1 = fp8pair(word >> 16);
+              const uint32_t b0 = fp8pair(word), b1 = fp8pair(word >> 16);
 #endif
 #pragma unroll
-            for (int r = 0; r < RT; ++r) mma(part[m][r][j], xa[r].x, xb[r].x, xa[r].y, xb[r].y, b0, b1);
+              for (int r = 0; r < RT; ++r) {
+                if (ksub == 0 && h == 0)
+                  mma0(part[m][r][j], xa[r].x, xb[r].x, xa[r].y, xb[r].y, b0, b1);
+                else
+                  mma(part[m][r][j], xa[r].x, xb[r].x, xa[r].y, xb[r].y, b0, b1);
+              }
+            }
           }
         }
       }
-      if (g % PER_SCALE == PER_SCALE - 1) {
+      if (live) {
 #pragma unroll
         for (int m = 0; m < M; ++m) {
-          const float s = __ldg(sc + m * NR * SG + g / PER_SCALE);
+          const float s = __ldg(sc + m * NR * SG + sg);
 #pragma unroll
           for (int r = 0; r < RT; ++r)
 #pragma unroll
@@ -264,7 +428,19 @@ __global__ void __launch_bounds__(PWARPS * 32, PMIN)
 template __global__ void fp8_expert_kernel<2, 2, 4>(const __nv_bfloat16* __restrict__, int, int, const uint4* __restrict__, const float* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__, void* __restrict__, int, float, int);
 template __global__ void fp8_expert_kernel<1, 0, 4>(const __nv_bfloat16* __restrict__, int, int, const uint4* __restrict__, const float* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__, void* __restrict__, int, float, int);
 template __global__ void fp8_expert_kernel<1, 3, 4>(const __nv_bfloat16* __restrict__, int, int, const uint4* __restrict__, const float* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__, void* __restrict__, int, float, int);
+template __global__ void fp8_expert_tma_kernel<2, 2, 2, 4>(const __nv_bfloat16* __restrict__, int, int, const uint4* __restrict__, const float* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__, void* __restrict__, int, float, int);
+template __global__ void fp8_expert_tma_kernel<1, 0, 3, 4>(const __nv_bfloat16* __restrict__, int, int, const uint4* __restrict__, const float* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__, void* __restrict__, int, float, int);
+template __global__ void fp8_expert_tma_kernel<1, 0, 2, 4>(const __nv_bfloat16* __restrict__, int, int, const uint4* __restrict__, const float* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__, void* __restrict__, int, float, int);
+template __global__ void fp8_expert_tma_kernel<1, 3, 2, 4>(const __nv_bfloat16* __restrict__, int, int, const uint4* __restrict__, const float* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__, void* __restrict__, int, float, int);
 template __global__ void fp8_expert_prompt_kernel<2, 2, 2, 2>(const __nv_bfloat16* __restrict__, int, int, const uint4* __restrict__, const float* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__, void* __restrict__, int, float, int);
 template __global__ void fp8_expert_prompt_kernel<1, 0, 4, 4>(const __nv_bfloat16* __restrict__, int, int, const uint4* __restrict__, const float* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__, void* __restrict__, int, float, int);
 template __global__ void fp8_expert_prompt_kernel<1, 3, 4, 4>(const __nv_bfloat16* __restrict__, int, int, const uint4* __restrict__, const float* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__, void* __restrict__, int, float, int);
+}
+
+#include "fp8_experts_k64.cuh"
+
+namespace tf_fp8_experts {
+template __global__ void fp8_expert_prompt_k64_kernel<2, 2, 2, 2, false, true>(const __nv_bfloat16* __restrict__, int, int, const uint4* __restrict__, const float* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__, void* __restrict__, int, float, int);
+template __global__ void fp8_expert_prompt_k64_kernel<1, 0, 4, 4, true, false>(const __nv_bfloat16* __restrict__, int, int, const uint4* __restrict__, const float* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__, void* __restrict__, int, float, int);
+template __global__ void fp8_expert_prompt_k64_kernel<1, 3, 4, 4, true, false>(const __nv_bfloat16* __restrict__, int, int, const uint4* __restrict__, const float* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__, void* __restrict__, int, float, int);
 }

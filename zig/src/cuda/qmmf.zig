@@ -39,6 +39,15 @@ pub fn sharedBytes(mode: Mode, bm: u32) u32 {
     return @max(4 * stage, partials);
 }
 
+/// Extra mbarrier dynamic SMEM on sm_120+ TMA 1D weight loads (BF16 and FP8G tiles).
+pub fn tmaBarriers(mode: Mode) u32 {
+    return if (mode == .bf16 or mode == .fp8g) 128 else 0;
+}
+
+pub fn sharedBytesFor(mode: Mode, bm: u32, tma: bool) u32 {
+    return sharedBytes(mode, bm) + if (tma) tmaBarriers(mode) else 0;
+}
+
 /// K slices for an (n, k) weight, from the shape alone so a row's bits never depend on the row count (qmm.split_k).
 pub fn splitK(n: usize, k: usize) u32 {
     const tiles = (n + bn - 1) / bn;
@@ -117,6 +126,10 @@ pub fn halfShared(mode: Mode) u32 {
     return @max(4 * stage, partials);
 }
 
+pub fn halfSharedFor(mode: Mode, tma: bool) u32 {
+    return halfShared(mode) + if (tma and mode == .bf16) @as(u32, 128) else 0;
+}
+
 /// MXFP8/BF16 decode calls take half tiles below this many 64-column blocks (TF_QMMF_HALF_BELOW; 0 never): same sums.
 pub const half_below_default: usize = 96;
 
@@ -141,20 +154,22 @@ const row_tiles = [_]u32{ 16, 32, 64 };
 /// What a call writes: bf16 rows, or the fp32 sums unrounded (a tensor-parallel rank's partial rows).
 pub const Out = enum { bf16, f32 };
 
-fn loadTiles(mod: Module, comptime mode: Mode, comptime wide: bool) ![7]Function {
+fn loadTiles(mod: Module, comptime mode: Mode, comptime wide: bool, tma: bool) ![7]Function {
     var set: [7]Function = undefined;
     inline for (row_tiles, 0..) |bm, ti| inline for (.{ false, true }, 0..) |cl, ci| {
         const f = try mod.function(symbol(mode, bm, cl, false, wide));
-        try f.allowDynamicShared(sharedBytes(mode, bm));
+        try f.allowDynamicShared(sharedBytesFor(mode, bm, tma));
         set[ti * 2 + ci] = f;
     };
     set[6] = try mod.function(symbol(mode, 64, false, true, wide));
-    try set[6].allowDynamicShared(sharedBytes(mode, 64));
+    try set[6].allowDynamicShared(sharedBytesFor(mode, 64, tma));
     return set;
 }
 
 /// BF16 prompt tile: 128x128, eight warps, three 32 KiB stages and one barrier per stage.
 pub const prompt_shared: u32 = 3 * (128 + 128) * group * 2 + 128;
+pub const fp8g_prompt_shared: u32 = 3 * ((128 * group * 2 + 128 * group + 128 * 4 + 127) / 128 * 128) + 128;
+pub const fp8g_prompt64_shared: u32 = 2 * ((64 * group * 2 + 128 * group + 128 * 4 + 127) / 128 * 128) + 128;
 pub const prompt_rows: usize = 512;
 pub const prompt_k32_shared: u32 = 3 * (128 + 128) * 32 * 2;
 
@@ -171,9 +186,17 @@ pub fn promptSymbol(comptime out: Out, comptime fused: bool) [:0]const u8 {
     return std.fmt.comptimePrint("_ZN7tf_qmmf11qmmf_kernelILi4ELi128ELi128ELi2ELi4ELi3ELb{d}ELb0ELb{d}EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", .{ @intFromBool(out == .f32), @intFromBool(fused) });
 }
 
-/// Only large BF16 grids use the prompt tile; the packed allocation contains complete 128-column tiles.
+pub fn fp8gPromptSymbol(comptime out: Out, comptime fused: bool) [:0]const u8 {
+    return std.fmt.comptimePrint("_ZN7tf_qmmf11qmmf_kernelILi3ELi128ELi128ELi2ELi4ELi3ELb{d}ELb0ELb{d}EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", .{ @intFromBool(out == .f32), @intFromBool(fused) });
+}
+
+pub fn fp8gPrompt64Symbol(comptime out: Out, comptime fused: bool) [:0]const u8 {
+    return std.fmt.comptimePrint("_ZN7tf_qmmf11qmmf_kernelILi3ELi64ELi128ELi1ELi4ELi2ELb{d}ELb0ELb{d}EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii", .{ @intFromBool(out == .f32), @intFromBool(fused) });
+}
+
+/// Large BF16 and FP8G grids use the 128x128 8-warp prompt tile; packed allocations hold complete 128-column tiles.
 pub fn promptEligible(m: usize, w: Weight) bool {
-    return m >= prompt_rows and w.mode == .bf16 and w.n >= 128 and
+    return m >= prompt_rows and (w.mode == .bf16 or w.mode == .fp8g) and w.n >= 128 and
         (w.k >= 512 or (w.n == 10240 and w.k == 320)) and w.npad % 128 == 0;
 }
 
@@ -186,14 +209,18 @@ pub const Lane = struct {
     half_below: usize = half_below_default,
     shared_down: [4]Function = undefined,
     prompt: ?[2][2]Function = null, // Out, then plain / fused; loadPrompt() fills it on sm_12x
+    fp8g_prompt: ?[2][2]Function = null, // Out, then plain / fused; FP8G 128x128 8-warp prompt tile
+    fp8g_prompt64: ?[2][2]Function = null, // Out, then plain / fused; FP8G 64x128 4w S2 prompt tile (2 CTAs/SM)
     prompt_k32: ?[2]Function = null, // Out; unsplit BF16 prompt calls, loadPrompt() fills it on sm_12x
     prompt_sms: usize = 0, // the device's SMs: the tile runs when its blocks fill more than half of them
     clusters: bool, // sm_90 on: slices meet in a cluster's shared memory
+    tma: bool = false, // sm_120 on: TMA 1D weight loads use mbarrier storage at end of SMEM
 
     pub fn load(d: *const Driver, capability_major: u32) !Lane {
         if (!kernels.available) return error.BuiltWithoutKernels;
         var mod = try Module.load(d, kernels.qmmf);
         errdefer mod.unload();
+        const tma = capability_major >= 12;
         var l: Lane = .{
             .mod = mod,
             .fns = undefined,
@@ -201,15 +228,16 @@ pub const Lane = struct {
             .reduce = undefined,
             .half = undefined,
             .clusters = capability_major >= 9,
+            .tma = tma,
         };
         inline for (modes, 0..) |mode, mi| {
-            l.fns[mi] = try loadTiles(mod, mode, false);
-            l.f32_fns[mi] = try loadTiles(mod, mode, true);
+            l.fns[mi] = try loadTiles(mod, mode, false, tma);
+            l.f32_fns[mi] = try loadTiles(mod, mode, true, tma);
         }
         for (&l.reduce, reduce_symbols) |*f, name| f.* = try mod.function(name);
         inline for (.{ Mode.mxfp8, Mode.bf16 }, 0..) |mode, mi| inline for (.{ false, true }, 0..) |wide, oi| inline for (.{ false, true }, 0..) |cl, ci| {
             const f = try mod.function(halfSymbol(mode, cl, wide));
-            try f.allowDynamicShared(halfShared(mode));
+            try f.allowDynamicShared(halfSharedFor(mode, tma));
             l.half[mi][oi][ci] = f;
         };
         for (@import("qmmf_shared.zig").symbols, &l.shared_down) |name, *f| {
@@ -229,6 +257,21 @@ pub const Lane = struct {
             try f.allowDynamicShared(prompt_shared);
             prompt[oi][fi] = f;
         };
+        var fp8g_prompt: [2][2]Function = undefined;
+        inline for (.{ Out.bf16, Out.f32 }, 0..) |out, oi| inline for (.{ false, true }, 0..) |fused, fi| {
+            const f = try l.mod.function(fp8gPromptSymbol(out, fused));
+            try f.allowDynamicShared(fp8g_prompt_shared);
+            fp8g_prompt[oi][fi] = f;
+        };
+        const fp8g_prompt64: ?[2][2]Function = blk: {
+            var p64: [2][2]Function = undefined;
+            inline for (.{ Out.bf16, Out.f32 }, 0..) |out, oi| inline for (.{ false, true }, 0..) |fused, fi| {
+                const f = l.mod.function(fp8gPrompt64Symbol(out, fused)) catch break :blk null;
+                f.allowDynamicShared(fp8g_prompt64_shared) catch break :blk null;
+                p64[oi][fi] = f;
+            };
+            break :blk p64;
+        };
         var k32: [2]Function = undefined;
         inline for (.{ Out.bf16, Out.f32 }, 0..) |out, oi| {
             const f = try l.mod.function(promptK32Symbol(out));
@@ -240,6 +283,8 @@ pub const Lane = struct {
         var sms: c_int = 0;
         try d.check(d.api.cuDeviceGetAttribute(&sms, .multiprocessor_count, dev), "cuDeviceGetAttribute");
         l.prompt = prompt;
+        l.fp8g_prompt = fp8g_prompt;
+        l.fp8g_prompt64 = fp8g_prompt64;
         l.prompt_k32 = k32;
         l.prompt_sms = @intCast(@max(sms, 1));
     }
@@ -264,6 +309,18 @@ pub const Lane = struct {
         return l.matmulOut(s, x, ldx, m, w, y, .f32, part);
     }
 
+    /// Whether `w` uses a single K-slice (`sk == 1`) and therefore supports fused FP32 add (`matmulF32Add`).
+    pub fn canAdd(l: Lane, w: Weight) bool {
+        _ = l;
+        return slices(w) == 1;
+    }
+
+    /// Fused `y[r, c] = __fadd_rn(add_src[r, c], (x @ w^T)[r, c])` in FP32 (`sk == 1` only; `add_src` may alias `y`).
+    pub fn matmulF32Add(l: Lane, s: Stream, x: u64, ldx: usize, m: usize, w: Weight, add_src: u64, y: u64) !void {
+        if (slices(w) != 1) return error.Invalid;
+        return l.matmulOutEx(s, x, ldx, m, w, y, .f32, 0, add_src);
+    }
+
     pub const matmulF32Strided = @import("qmmf_shared.zig").matmulF32Strided;
 
     /// The actual prompt selection: loaded tiles, the pinned slice plan, and blocks over half the SMs.
@@ -275,17 +332,22 @@ pub const Lane = struct {
 
     /// matmul() writing y as `out` says: bf16, or fp32.
     pub fn matmulOut(l: Lane, s: Stream, x: u64, ldx: usize, m: usize, w: Weight, y: u64, out: Out, part: u64) !void {
+        return l.matmulOutEx(s, x, ldx, m, w, y, out, part, 0);
+    }
+
+    fn matmulOutEx(l: Lane, s: Stream, x: u64, ldx: usize, m: usize, w: Weight, y: u64, out: Out, part: u64, add_src: u64) !void {
         const p = planFor(m, w, l.clusters);
         if (p.reduce and part == 0) return error.MissingLanePart;
         const set = (if (out == .f32) l.f32_fns else l.fns)[modeIndex(w.mode)];
         const ti: usize = if (p.bm == 16) 0 else if (p.bm == 32) 1 else 2;
         const prompt = l.usesPrompt(m, w);
-        const k32 = prompt and p.sk == 1 and l.prompt_k32 != null;
-        const bm: usize = if (prompt) 128 else p.bm;
+        const k32 = prompt and w.mode == .bf16 and p.sk == 1 and l.prompt_k32 != null;
+        const fp8g64 = prompt and w.mode == .fp8g and l.fp8g_prompt64 != null;
+        const bm: usize = if (fp8g64) 64 else if (prompt) 128 else p.bm;
         const rows_t = (m + bm - 1) / bm;
         const hm = halfModeIndex(w.mode);
         const half = hm != null and p.bm == 16 and !p.fused and rows_t * ((w.n + bn - 1) / bn) * p.sk < l.half_below;
-        const f = if (k32) l.prompt_k32.?[@backingInt(out)] else if (prompt) l.prompt.?[@backingInt(out)][@intFromBool(p.fused)] else if (half) l.half[hm.?][@backingInt(out)][@intFromBool(p.cluster)] else if (p.fused) set[6] else set[ti * 2 + @intFromBool(p.cluster)];
+        const f = if (k32) l.prompt_k32.?[@backingInt(out)] else if (fp8g64) l.fp8g_prompt64.?[@backingInt(out)][@intFromBool(p.fused)] else if (prompt) (if (w.mode == .fp8g) l.fp8g_prompt.? else l.prompt.?)[@backingInt(out)][@intFromBool(p.fused)] else if (half) l.half[hm.?][@backingInt(out)][@intFromBool(p.cluster)] else if (p.fused) set[6] else set[ti * 2 + @intFromBool(p.cluster)];
         const cols: usize = if (prompt) 128 else if (half) 32 else bn;
         const band = @max(1, @min(rows_t, (12 << 20) / (bm * w.k * 2)));
         var args: launch_.Args = .{};
@@ -294,7 +356,7 @@ pub const Lane = struct {
         args.add(w.scales);
         args.add(w.scale);
         args.add(y);
-        args.add(if (p.reduce) part else @as(u64, 0));
+        args.add(if (p.reduce) part else if (p.sk == 1 and out == .f32) add_src else @as(u64, 0));
         args.add(@as(i32, @intCast(m)));
         args.add(@as(i32, @intCast(w.n)));
         args.add(@as(i32, @intCast(w.k)));
@@ -304,8 +366,8 @@ pub const Lane = struct {
         args.add(@as(i32, @intCast(band)));
         try launch_.launch(f, .{
             .grid = .{ .x = @intCast(rows_t * ((w.n + cols - 1) / cols)), .y = 1, .z = if (p.fused) 1 else p.sk },
-            .block = .{ .x = if (prompt) 256 else threads, .y = 1, .z = 1 },
-            .shared = if (k32) prompt_k32_shared else if (prompt) prompt_shared else if (half) halfShared(w.mode) else sharedBytes(w.mode, p.bm),
+            .block = .{ .x = if (prompt and !fp8g64) 256 else threads, .y = 1, .z = 1 },
+            .shared = if (k32) prompt_k32_shared else if (fp8g64) fp8g_prompt64_shared else if (prompt) (if (w.mode == .fp8g) fp8g_prompt_shared else prompt_shared) else if (half) halfSharedFor(w.mode, l.tma) else sharedBytesFor(w.mode, p.bm, l.tma),
             .cluster = if (p.cluster) .{ .x = 1, .y = 1, .z = p.sk } else null,
         }, s, &args);
         if (p.reduce) {
@@ -361,6 +423,7 @@ test "tile shared bytes, slices and row tiles as the Python host picks them" {
     try std.testing.expectEqual(@as(u32, 25600), sharedBytes(.fp8g, 16));
     try std.testing.expectEqual(@as(u32, 33792), sharedBytes(.fp8g, 32));
     try std.testing.expectEqual(@as(u32, 50176), sharedBytes(.fp8g, 64));
+    try std.testing.expectEqual(@as(u32, 25728), sharedBytesFor(.fp8g, 16, true));
     try std.testing.expectEqual(@as(u32, 25088), sharedBytes(.mxfp8, 16));
     try std.testing.expectEqual(@as(u32, 33280), sharedBytes(.mxfp8, 32));
     try std.testing.expectEqual(@as(u32, 49664), sharedBytes(.mxfp8, 64));
@@ -369,6 +432,7 @@ test "tile shared bytes, slices and row tiles as the Python host picks them" {
     try std.testing.expectEqual(@as(u32, 41984), sharedBytes(.fp4, 64));
     try std.testing.expectEqual(@as(u32, 24576), sharedBytes(.fp8, 16)); // no scale tile: 4 x (2048 + 4096)
     try std.testing.expectEqual(@as(u32, 40960), sharedBytes(.bf16, 16)); // 4 x (2048 + 8192)
+    try std.testing.expectEqual(@as(u32, 41088), sharedBytesFor(.bf16, 16, true)); // + 128 TMA barriers
     try std.testing.expectEqual(@as(u32, 65536), sharedBytes(.bf16, 64));
     try std.testing.expectEqual(@as(u32, 2), splitK(7168, 2560)); // values from qmm.split_k itself
     try std.testing.expectEqual(@as(u32, 8), splitK(2560, 6144));
@@ -517,21 +581,6 @@ test "prompt dispatch changes CTA geometry and output instance without changing 
     try std.testing.expectEqual(@as(i32, 4), Trace.sk);
 }
 
-test "a cut weight pinned to the whole weight's K slices plans as the whole one at every row count" {
-    const whole: Weight = .{ .mode = .bf16, .codes = 0, .scales = 0, .n = 16480, .k = 2560, .npad = 16512 };
-    var cut = whole;
-    cut.n = 8240;
-    cut.npad = 8320;
-    try std.testing.expectEqual(@as(u32, 1), splitK(whole.n, whole.k));
-    try std.testing.expectEqual(@as(u32, 2), splitK(cut.n, cut.k)); // unpinned, the half would sum two slices
-    const kept = try pinned(cut, splitK(whole.n, whole.k));
-    for ([_]usize{ 1, 16, 64, 1536 }) |m| for ([_]bool{ false, true }) |cl| {
-        try std.testing.expectEqual(plan(m, whole.n, whole.k, cl), planFor(m, kept, cl));
-        try std.testing.expectEqual(plan(m, cut.n, cut.k, cl), planFor(m, cut, cl));
-    };
-    try std.testing.expect(planFor(1536, cut, false).sk != planFor(1536, kept, false).sk);
-    try std.testing.expectEqual(splitK(whole.n, whole.k), slices(kept)); // what the BF16 prompt tile folds, too
-    try std.testing.expectEqual(splitK(cut.n, cut.k), slices(cut));
-    try std.testing.expectEqual(@as(u32, 4), (try pinned(cut, 4)).sk); // 40 groups: 10 a slice
-    for ([_]u32{ 0, 3, 8, 16 }) |bad| try std.testing.expectError(error.BadSplit, pinned(cut, bad)); // 8: 5 a slice
+test {
+    _ = @import("qmmf_host_test.zig");
 }

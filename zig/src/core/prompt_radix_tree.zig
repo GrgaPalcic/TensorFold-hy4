@@ -107,7 +107,7 @@ pub const Tree = struct {
     /// Snapshots the tree holds.
     snaps: usize = 0,
     counts: Counts = .{},
-
+    on_evict: ?struct { ctx: *anyopaque, call: *const fn (*anyopaque, *Node) void } = null,
     pub fn init(gpa: Allocator, family: Snapshots, pages: Pages, page: usize, ahead: usize, per: usize) !Tree {
         const root = try gpa.create(Node);
         root.* = .{ .parent = null, .end = 0, .tokens = &.{}, .pages = &.{} };
@@ -359,6 +359,7 @@ pub const Tree = struct {
     pub fn evict(t: *Tree, n: *Node) void {
         const e = n.entry orelse return;
         std.debug.assert(n.pins == 0); // a keep or a restore in progress
+        if (t.on_evict) |h| h.call(h.ctx, n);
         t.dropEntry(e);
         n.entry = null;
         t.snaps -= 1;

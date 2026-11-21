@@ -59,6 +59,10 @@ pub fn Kept(comptime V: type) type {
             return @ptrCast(@alignCast(ptr));
         }
 
+        pub fn bind(ptr: anytype, ctx: *const cuda.Context) void {
+            if (@hasDecl(V, "bind")) V.bind(@as(*Target, @ptrCast(@alignCast(ptr))), ctx);
+        }
+
         fn driver(t: *Target) *const cuda.Driver {
             return if (@hasDecl(V, "driver")) V.driver(t) else t.d;
         }
@@ -88,6 +92,8 @@ pub fn Kept(comptime V: type) type {
 
         /// Image ranges between `host` and the state's buffers; `host` is the store's: every copy lands before return.
         fn copy(t: *Target, st: *State, ranges: Ranges, host: []u8, out: bool) !void {
+            if (@hasDecl(V, "copyCustom")) if (try V.copyCustom(t, st, ranges, host, out)) return;
+            if (@hasDecl(V, "bindCurrent")) V.bindCurrent(t);
             const d = driver(t);
             const s = stream(t);
             // a later range's failure leaves earlier copies queued on `host`, which its caller then frees or reuses
@@ -136,7 +142,9 @@ pub fn Kept(comptime V: type) type {
         }
 
         fn blank(ptr: *anyopaque, at: u32) anyerror!Saved {
-            return @ptrCast(try V.blank(of(ptr), at));
+            const t = of(ptr);
+            if (@hasDecl(V, "bindCurrent")) V.bindCurrent(t);
+            return @ptrCast(try V.blank(t, at));
         }
 
         fn whole(ptr: *anyopaque, saved: Saved) bool {
@@ -187,8 +195,10 @@ pub fn Kept(comptime V: type) type {
             };
             const st = hook.saved orelse return hook.failed orelse error.ProbeUnmarked;
             if (!probed(t, st)) return error.ProbeUnmarked;
-            const bufs = V.buffers(st);
-            const held = (if (bufs[0]) |b| b.len else 0) + (if (bufs[1]) |b| b.len else 0);
+            const held = if (@hasDecl(V, "heldBytes")) V.heldBytes(t, st) else blk: {
+                const bufs = V.buffers(st);
+                break :blk (if (bufs[0]) |b| b.len else 0) + (if (bufs[1]) |b| b.len else 0);
+            };
             const bytes = try a.alloc(u8, words + held);
             defer a.free(bytes);
             try copy(t, st, &.{.{ .off = 0, .len = bytes.len }}, bytes, true);

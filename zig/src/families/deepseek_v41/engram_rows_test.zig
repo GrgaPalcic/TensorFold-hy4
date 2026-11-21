@@ -404,3 +404,129 @@ test "engram rows: a row past a shard shortened after open fails by name in ever
         try testing.expectError(want, r.rows(0, &.{last}, 256, out));
     }
 }
+
+test "engram rows: openSpecs and rawRows serve 100-byte records from a rank slice of one whole table across modes" {
+    const a = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const total: u64 = 300;
+    const rb: u64 = 100;
+    const bytes = try a.alloc(u8, @intCast(er.header_bytes + total * rb));
+    defer a.free(bytes);
+    @memset(bytes, 0);
+    for (0..total) |row| for (0..rb) |j| {
+        bytes[@intCast(er.header_bytes + row * rb + j)] = @truncate((row * 131 + j * 17) ^ 0x5a);
+    };
+    try tmp.dir.writeFile(io, .{ .sub_path = "engram_layer1.hy4e", .data = bytes });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const path = try std.fs.path.join(a, &.{ root, "engram_layer1.hy4e" });
+    defer a.free(path);
+    const spec: er.OpenSpec = .{
+        .path = path,
+        .h = .{ .layer = 1, .lo = 100, .hi = 200, .total = total, .row_bytes = rb },
+        .file_lo = 0,
+        .file_hi = total,
+        .align_bytes = er.page,
+    };
+    const q = [_]i64{ 199, 100, 157, 100, 199 };
+    const got = try a.alloc(u8, q.len * @as(usize, @intCast(rb)));
+    defer a.free(got);
+    for (modes) |mode| {
+        const r = try er.Rows.openSpecs(a, &.{spec}, 4096);
+        defer r.close();
+        if (mode == .aio or mode == .aio_poll) {
+            try r.startAio();
+            r.aio.?.poll = mode == .aio_poll;
+        } else {
+            if (r.aio) |*x| {
+                x.deinit();
+                r.aio = null;
+            }
+            if (mode != .uring) if (r.ring) |*g| {
+                g.deinit();
+                r.ring = null;
+            };
+            if (mode == .pool and r.pool == null) try r.startPool(4);
+            if (mode == .sync) r.stopPool();
+        }
+        try testing.expectError(error.EngramRowOutsideShard, r.rawRows(0, &.{99}, got[0..100]));
+        try testing.expectError(error.EngramRowOutsideShard, r.rawRows(0, &.{200}, got[0..100]));
+        try r.issue(0, &.{ 100, 199 });
+        try r.rawRows(0, &q, got);
+        for (q, 0..) |id, i| {
+            const row: u64 = @intCast(id);
+            try testing.expectEqualSlices(u8, bytes[@intCast(er.header_bytes + row * rb)..][0..100], got[i * 100 ..][0..100]);
+        }
+        const hits = r.stats.hits;
+        try r.rawRows(0, &q, got);
+        try testing.expect(r.stats.hits > hits);
+    }
+}
+
+test "engram rows: hybrid io_uring keeps small reads on ring and lazily pools >512-extent bulk batches" {
+    const a = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const rb: u64 = 100;
+    const stride: u64 = 128; // 12,800 B > page + merge_gap -> 1 distinct extent per row
+    const n_bulk: usize = 520;
+    const total: u64 = (n_bulk + 4) * stride;
+    const bytes = try a.alloc(u8, @intCast(er.header_bytes + total * rb));
+    defer a.free(bytes);
+    @memset(bytes, 0);
+    var bulk_ids: [n_bulk]i64 = undefined;
+    for (0..n_bulk) |i| {
+        const row: u64 = @as(u64, i) * stride;
+        bulk_ids[i] = @intCast(row);
+        for (0..rb) |j| bytes[@intCast(er.header_bytes + row * rb + j)] = @truncate((row * 97 + j * 31) ^ 0xa5);
+    }
+    const tail_ids = [_]i64{ @intCast(n_bulk * stride), @intCast((n_bulk + 1) * stride), @intCast((n_bulk + 2) * stride) };
+    for (tail_ids) |id| {
+        const row: u64 = @intCast(id);
+        for (0..rb) |j| bytes[@intCast(er.header_bytes + row * rb + j)] = @truncate((row * 97 + j * 31) ^ 0xa5);
+    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "engram_hybrid.hy4e", .data = bytes });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const path = try std.fs.path.join(a, &.{ root, "engram_hybrid.hy4e" });
+    defer a.free(path);
+    const spec: er.OpenSpec = .{
+        .path = path,
+        .h = .{ .layer = 1, .lo = 0, .hi = total, .total = total, .row_bytes = rb },
+        .file_lo = 0,
+        .file_hi = total,
+        .align_bytes = er.page,
+    };
+    const r = try er.Rows.openSpecs(a, &.{spec}, 4096);
+    errdefer r.close();
+    if (r.ring == null) {
+        r.close();
+        return;
+    }
+    try testing.expect(r.pool == null);
+    const small_out = try a.alloc(u8, tail_ids.len * @as(usize, @intCast(rb)));
+    defer a.free(small_out);
+    try r.rawRows(0, tail_ids[0..1], small_out[0..100]);
+    try testing.expect(r.pool == null);
+    try testing.expectEqualSlices(u8, bytes[@intCast(er.header_bytes + @as(u64, @intCast(tail_ids[0])) * rb)..][0..100], small_out[0..100]);
+
+    const bulk_out = try a.alloc(u8, n_bulk * @as(usize, @intCast(rb)));
+    defer a.free(bulk_out);
+    try r.issue(0, &bulk_ids);
+    try testing.expect(r.pool != null);
+    // Small read while bulk batch is in flight on pool: exercises concurrent ring slotFor + pooled workers.
+    try r.rawRows(0, tail_ids[1..3], small_out[100..300]);
+    try r.rawRows(0, &bulk_ids, bulk_out);
+    for (tail_ids[1..3], 0..) |id, k| {
+        const row: u64 = @intCast(id);
+        try testing.expectEqualSlices(u8, bytes[@intCast(er.header_bytes + row * rb)..][0..100], small_out[(k + 1) * 100 ..][0..100]);
+    }
+    for (bulk_ids, 0..) |id, i| {
+        const row: u64 = @intCast(id);
+        try testing.expectEqualSlices(u8, bytes[@intCast(er.header_bytes + row * rb)..][0..100], bulk_out[i * 100 ..][0..100]);
+    }
+    try r.closeChecked();
+}

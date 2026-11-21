@@ -17,10 +17,26 @@ const piece: u64 = 16 << 20;
 pub const Want = struct { name: Name, window: u32, k: u32, bytes: u64 };
 
 /// A kept entry waiting to be written, with the chunk starts below it (a planned family's state depends on them).
+pub const Release = struct {
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, entry: *pc.Entry) void,
+};
+
 pub const Queued = struct {
     entry: *pc.Entry,
     starts: []u32,
     waited: bool = false, // the jobs in flight once left it no room, so losing its entry counts as a skipped save
+    partial: bool = false, // at least one block-only batch was staged; holds off 0-ref sweep until final batch
+    release: ?Release = null,
+
+    pub fn finish(q: Queued) void {
+        if (q.release) |rel| rel.call(rel.ctx, q.entry);
+    }
+
+    pub fn drop(q: Queued, gpa: std.mem.Allocator) void {
+        gpa.free(q.starts);
+        q.finish();
+    }
 };
 
 /// A kept state being written: the blocks the disk lacks, then its own file a piece at a time.
@@ -39,18 +55,29 @@ pub const Job = struct {
     reserved: bool = false,
     blocks: u32 = 0, // blocks it wrote
     began: i128 = 0,
+    release: ?Release = null,
 };
 
 /// A newly kept entry joins the queue (the RAM store calls this on every new keep), with the request's chunk starts.
 pub fn queued(r: *Rows, e: *pc.Entry, starts: []const u32) void {
-    const own = rows_store.startsBelow(r, r.gpa, starts, e.at) catch return;
-    r.queue.append(r.gpa, .{ .entry = e, .starts = own }) catch r.gpa.free(own);
+    queuedWithRelease(r, e, starts, null);
+}
+
+pub fn queuedWithRelease(r: *Rows, e: *pc.Entry, starts: []const u32, release: ?Release) void {
+    const own = rows_store.startsBelow(r, r.gpa, starts, e.at) catch {
+        if (release) |rel| rel.call(rel.ctx, e);
+        return;
+    };
+    r.queue.append(r.gpa, .{ .entry = e, .starts = own, .release = release }) catch {
+        r.gpa.free(own);
+        if (release) |rel| rel.call(rel.ctx, e);
+    };
 }
 
 /// An entry leaving the RAM store leaves the queue, and its write is given up if under way.
 pub fn dropped(r: *Rows, e: *pc.Entry) void {
     for (r.queue.items, 0..) |q, i| if (q.entry == e) {
-        r.gpa.free(q.starts);
+        q.drop(r.gpa);
         _ = r.queue.orderedRemove(i);
         break;
     };
@@ -122,8 +149,12 @@ fn begin(r: *Rows, q: Queued) bool {
     const j = (prepare(r, q) catch |err| {
         r.counts.skipped += 1;
         pc.note("imprint: {d} tokens stay in RAM only ({s})", .{ q.entry.at, @errorName(err) });
+        q.finish();
         return false;
-    }) orelse return false;
+    }) orelse {
+        q.finish();
+        return false;
+    };
     r.job = j;
     admit(r, j) catch |err| {
         r.counts.skipped += 1;
@@ -155,7 +186,7 @@ pub fn prepare(r: *Rows, q: Queued) !?*Job {
     errdefer own.deinit(gpa);
     try image.ownRanges(parts, e.at, r.keying.block, &own, gpa);
     const j = try gpa.create(Job);
-    j.* = .{ .entry = e, .starts = q.starts, .name = name, .parts = parts, .wants = &.{}, .own = &.{}, .began = nowNs() };
+    j.* = .{ .entry = e, .starts = q.starts, .name = name, .parts = parts, .wants = &.{}, .own = &.{}, .began = nowNs(), .release = q.release };
     j.wants = wants.toOwnedSlice(gpa) catch |err| {
         gpa.destroy(j);
         return err;
@@ -276,5 +307,6 @@ fn finishJob(r: *Rows, j: *Job, ok: bool) void {
     r.gpa.free(j.wants);
     r.gpa.free(j.own);
     r.job = null;
+    if (j.release) |rel| rel.call(rel.ctx, j.entry);
     r.gpa.destroy(j);
 }

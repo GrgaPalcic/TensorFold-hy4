@@ -22,4 +22,5 @@ test {
     _ = @import("rows_drop_test.zig");
     _ = @import("rows_restore_burst_test.zig");
     _ = @import("rows_image_note_test.zig");
+    _ = @import("prompt_radix_disk_test.zig");
 }

@@ -31,6 +31,7 @@ pub const Job = struct {
     bytes: u64,
     staged: u64,
     verify: bool = false,
+    publishes: bool = true,
     began: i128 = 0,
     done: std.atomic.Value(bool) = .init(false),
     taken: bool = false,
@@ -38,7 +39,7 @@ pub const Job = struct {
 
     /// The block files it writes: every file but the last, which is the state's own.
     pub fn blocks(j: *const Job) []File {
-        return j.files[0..j.files.len -| 1];
+        return if (j.publishes) j.files[0..j.files.len -| 1] else j.files;
     }
 
     pub fn destroy(j: *Job) void {
@@ -138,7 +139,7 @@ pub const Worker = struct {
     pub fn names(w: *Worker, name: chain.Name) bool {
         w.lock();
         defer w.mutex.unlock();
-        for (w.slots) |s| if (s) |j| if (std.mem.eql(u8, &j.name, &name)) return true;
+        for (w.slots) |s| if (s) |j| if (j.publishes and std.mem.eql(u8, &j.name, &name)) return true;
         return false;
     }
 

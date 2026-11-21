@@ -85,7 +85,8 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const cuda = @import("cuda_runtime.zig").runtimeWithTargets(b, target, optimize, if (nvcc != null or prebuilt != null) &images else &.{}, null, if (nvcc != null and prebuilt == null) sms else "");
     const mods = family(b, target, optimize, cuda, draft_ids);
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip });
-    const native = engines(b, target, optimize, cuda, mods.core, mods.lanes, mods.nemotron, mods.heat, mods.qwen35, mods.qwen_vision);
+    const tp_image: ?std.Build.LazyPath = if (nvcc) |tool| @import("tp.zig").mailboxFatbin(b, tool) else null;
+    const native = engines_build.enginesWithTp(b, target, optimize, cuda, mods.core, mods.lanes, mods.nemotron, mods.heat, mods.qwen35, mods.qwen_vision, tp_image);
     for ([_]struct { []const u8, *std.Build.Module }{ .{ "cuda", cuda }, .{ "core", mods.core }, .{ "lanes", mods.lanes }, .{ "nemotron", mods.nemotron }, .{ "dory", native.engines.import_table.get("dory").? }, .{ "cluster", @import("cluster_cuda.zig").module(b, target, optimize, mods.lanes, mods.core, native.canon, native.verbs) } }) |m| cli.addImport(m[0], m[1]);
     cli.addOptions("build_options", build_options);
     cli.addImport("checkpoint_cli", checkpointCli(b, target, optimize, strip, native.engines, mods.core));
@@ -112,9 +113,12 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     runner.addImport("exlr8_frozen", b.createModule(.{ .root_source_file = b.path("zig/tests/fixtures/exlr8/frozen.zig"), .target = target, .optimize = optimize }));
     runner.addImport("exlr8_frozen_dense", b.createModule(.{ .root_source_file = b.path("zig/tests/fixtures/exlr8/frozen_dense.zig"), .target = target, .optimize = optimize }));
     for (exlr8_build.denseModules(b, target, optimize, exlr8, exlr8_tests[0])) |m| runner.addImport(m.name, m.module);
-    runner.addImport("glm_cuda", glmCuda(b, target, optimize, cuda, mods.core, mods.lanes, mods.heat, mods.api));
+    const glm_runner = glmCuda(b, target, optimize, cuda, mods.core, mods.lanes, mods.heat, mods.api);
+    runner.addImport("glm_cuda", glm_runner);
     @import("minimax_cuda.zig").targets(b, target, optimize, strip, cuda, mods.core, mods.lanes, runner);
-    for ([_]struct { []const u8, *std.Build.Module }{ .{ "kolibri1", kolibri1Module(b, target, optimize, cuda, mods.core, mods.lanes) }, .{ "dory", @import("dory.zig").module(b, target, optimize, cuda, mods.core, mods.lanes) } }) |m| runner.addImport(m[0], m[1]);
+    const hy4_mod = @import("hy4.zig").moduleShared(b, target, optimize, cuda, mods.core, mods.lanes, glm_runner.import_table.get("tp").?, mods.api, tp_image);
+    @import("hy4.zig").installTools(b, target, optimize, strip, hy4_mod);
+    for ([_]struct { []const u8, *std.Build.Module }{ .{ "kolibri1", kolibri1Module(b, target, optimize, cuda, mods.core, mods.lanes) }, .{ "dory", @import("dory.zig").module(b, target, optimize, cuda, mods.core, mods.lanes) }, .{ "hy4", hy4_mod } }) |m| runner.addImport(m[0], m[1]);
     runner.addImport("gemma4_cuda", @import("gemma4_cuda.zig").module(b, target, optimize, cuda, mods.core, mods.lanes));
     runner.addImport("spark25", @import("spark25.zig").module(b, target, optimize, cuda, mods.core, mods.lanes));
     runner.addImport("moss_image_cuda", b.createModule(.{ .root_source_file = b.path("zig/src/families/moss_image/cuda_kernels.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "cuda", .module = cuda }} }));
@@ -135,7 +139,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     contract_images.dependOn(fatbin_step);
     @import("cuda_contract_deepseek.zig").images(b, runner_exe, contract_images, kernels, &images, prebuilt, nvcc, version, sms, opts.cuobjdump);
     @import("dsv41_serve.zig").install(b, target, optimize, cuda, nvcc != null or prebuilt != null);
-    const server_exe = nativeServer(b, target, optimize, cuda, mods.core, mods.lanes, mods.nemotron, mods.heat, mods.qwen35, mods.qwen_vision, mods.tokenizer, mods.living, build_options, true, strip);
+    const server_exe = nativeServerWithTp(b, target, optimize, cuda, mods.core, mods.lanes, mods.nemotron, mods.heat, mods.qwen35, mods.qwen_vision, mods.tokenizer, mods.living, build_options, true, strip, tp_image);
     b.step("compile-config-server", "Compile the actual CUDA server config entry point without installing or running").dependOn(&server_exe.step);
     // tf-qwen35-cuda: the Qwen CUDA forward's rows for a reference to compare, and its tower on picture files
     const q35 = b.createModule(.{ .root_source_file = b.path("zig/tests/qwen35_cuda_main.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip });
@@ -172,7 +176,11 @@ pub fn checkpointCli(b: *std.Build, target: std.Build.ResolvedTarget, optimize: 
 
 /// `zig build native`: tensorfold-native with the CUDA engines into zig-out/native/bin, as the Metal build makes it.
 pub fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, heat: *std.Build.Module, qwen35: *std.Build.Module, qwen_vision: *std.Build.Module, tokenizer: *std.Build.Module, living: *std.Build.Module, build_options: *std.Build.Step.Options, install_native: bool, strip: ?bool) *std.Build.Step.Compile {
-    const m = engines(b, target, optimize, cuda, core, lanes, nemotron, heat, qwen35, qwen_vision);
+    return nativeServerWithTp(b, target, optimize, cuda, core, lanes, nemotron, heat, qwen35, qwen_vision, tokenizer, living, build_options, install_native, strip, null);
+}
+
+pub fn nativeServerWithTp(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, heat: *std.Build.Module, qwen35: *std.Build.Module, qwen_vision: *std.Build.Module, tokenizer: *std.Build.Module, living: *std.Build.Module, build_options: *std.Build.Step.Options, install_native: bool, strip: ?bool, tp_image: ?std.Build.LazyPath) *std.Build.Step.Compile {
+    const m = engines_build.enginesWithTp(b, target, optimize, cuda, core, lanes, nemotron, heat, qwen35, qwen_vision, tp_image);
     // the HTTP side keeps its safety checks; the engine below it runs at `optimize` (the tokenizer is the family's)
     const template = b.createModule(.{ .root_source_file = b.path("zig/src/core/template/template.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
     const exe = b.addExecutable(.{ .name = "tensorfold-native", .root_module = b.createModule(.{
@@ -370,6 +378,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     skip_drafts.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"zero grant:"} })).step);
     @import("glm_family_host.zig").steps(b, cuda, glm, mods, step);
     @import("kolibri.zig").host(b, kolibri1Module(b, host, .debug, cuda, mods.core, mods.lanes), native_modules.api, step);
+    @import("hy4.zig").host(b, @import("hy4.zig").module(b, host, .debug, cuda, mods.core, mods.lanes), server_tests, step);
     const gemma = @import("gemma4_cuda.zig").module(b, host, .debug, cuda, mods.core, mods.lanes);
     b.step("test-gemma-grants-host", "Gemma assistant and DFlash head-cost grants without a GPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gemma, .filters = &.{"shared head costs:"} })).step);
     @import("gemma4_cuda.zig").host(b, gemma, step);

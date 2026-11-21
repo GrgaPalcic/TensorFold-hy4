@@ -17,18 +17,33 @@ pub const Header = struct {
     total: u64,
     row_bytes: u64,
 
+    /// Checks row geometry and `[file_lo, file_hi)` byte size against `size`, with `[lo, hi)` in range.
+    pub fn checkRange(h: Header, file_lo: u64, file_hi: u64, size: u64) !void {
+        if (h.row_bytes == 0 or file_lo > h.lo or h.hi < h.lo or h.hi > file_hi or file_hi > h.total) return error.BadEngramShard;
+        const payload = std.math.mul(u64, file_hi - file_lo, h.row_bytes) catch return error.BadEngramShard;
+        const expected = std.math.add(u64, header_bytes, payload) catch return error.BadEngramShard;
+        if (size != expected) return error.BadEngramShard;
+    }
+
     /// The header's six words, checked against the file's size.
     pub fn parse(b: *const [48]u8, size: u64) !Header {
         var w: [6]u64 = undefined;
         for (&w, 0..) |*x, i| x.* = std.mem.readInt(u64, b[8 * i ..][0..8], .little);
         if (w[0] != magic) return error.NotEngramShard;
         const h: Header = .{ .layer = w[1], .lo = w[2], .hi = w[3], .total = w[4], .row_bytes = w[5] };
-        if (h.row_bytes != row_bytes or h.hi < h.lo or h.hi > h.total) return error.BadEngramShard;
-        const payload = std.math.mul(u64, h.hi - h.lo, h.row_bytes) catch return error.BadEngramShard;
-        const expected = std.math.add(u64, header_bytes, payload) catch return error.BadEngramShard;
-        if (size != expected) return error.BadEngramShard;
+        if (h.row_bytes != row_bytes) return error.BadEngramShard;
+        try h.checkRange(h.lo, h.hi, size);
         return h;
     }
+};
+
+/// A table file and the row slice `[h.lo, h.hi)` this rank owns inside `[file_lo, file_hi)`.
+pub const OpenSpec = struct {
+    path: []const u8,
+    h: Header,
+    file_lo: u64,
+    file_hi: u64,
+    align_bytes: u64 = page,
 };
 
 /// torch's float8_e4m3fn -> float32 (c10 fp8e4m3fn_to_fp32_value, bit for bit).

@@ -66,9 +66,59 @@ pub const Rows = struct {
             made += 1;
             if (t.h.layer != l) return error.BadEngramShard;
         }
+        try r.initIo();
+        return r;
+    }
+
+    /// Opens tables described by `specs` (arbitrary row size and slice `[h.lo, h.hi)` inside `[file_lo, file_hi)`).
+    pub fn openSpecs(gpa: std.mem.Allocator, specs: []const format.OpenSpec, cap: u32) !*Rows {
+        if (cap < 4096 or specs.len == 0) return error.EngramCacheTooSmall;
+        const r = try gpa.create(Rows);
+        errdefer gpa.destroy(r);
+        const owned = try format.storage(Table, gpa, specs.len);
+        errdefer gpa.free(owned.tables);
+        errdefer gpa.destroy(owned.lut);
+        r.* = .{ .gpa = gpa, .tables = owned.tables, .ring = null, .lut = owned.lut, .cap = cap };
+        fillTable(r.lut);
+        var made: usize = 0;
+        errdefer for (r.tables[0..made]) |*t| r.closeTable(t);
+        for (specs, r.tables) |spec, *t| {
+            t.* = try openSpecTable(gpa, spec, cap);
+            made += 1;
+        }
+        try r.initIo();
+        return r;
+    }
+
+    fn openSpecTable(gpa: std.mem.Allocator, spec: format.OpenSpec, cap: u32) !Table {
+        if (spec.align_bytes == 0 or spec.align_bytes > page or page % spec.align_bytes != 0) return error.BadEngramShard;
+        const zpath = try gpa.dupeSentinel(u8, spec.path, 0);
+        defer gpa.free(zpath);
+        var direct = true;
+        var rc = linux.openat(linux.AT.FDCWD, zpath, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .DIRECT = true }, 0);
+        if (linux.errno(rc) != .SUCCESS) {
+            direct = false;
+            rc = linux.openat(linux.AT.FDCWD, zpath, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+            if (linux.errno(rc) != .SUCCESS) return error.FileNotFound;
+        }
+        const fd: linux.fd_t = @intCast(rc);
+        errdefer _ = linux.close(fd);
+        var st: linux.Statx = undefined;
+        if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .SIZE = true }, &st)) != .SUCCESS) return error.StatFailed;
+        try spec.h.checkRange(spec.file_lo, spec.file_hi, st.size);
+        const hb = try gpa.alignedAlloc(u8, .fromByteUnits(page), page);
+        defer gpa.free(hb);
+        if (direct) direct = try @import("engram_dio.zig").directAt(fd, hb, spec.align_bytes);
+        var t = try engram_io.tableStorage(gpa, fd, direct, spec.h, st.size, cap);
+        t.file_lo = spec.file_lo;
+        t.align_bytes = spec.align_bytes;
+        return t;
+    }
+
+    fn initIo(r: *Rows) !void {
         // TF_DSV41_ENGRAM_URING=0: the reader threads even where io_uring works (a container that allows it, A/B)
         const uring_off = !try @import("sys").environment.read(bool, "TF_DSV41_ENGRAM_URING", true);
-        r.ring = (if (uring_off) error.PermissionDenied else linux.IoUring.init(256, 0)) catch |e| blk: {
+        r.ring = (if (uring_off) error.PermissionDenied else linux.IoUring.init(1024, 0)) catch |e| blk: {
             if ((try aioEnv())) {
                 if (Aio.init()) |a| {
                     r.aio = a;
@@ -83,12 +133,19 @@ pub const Rows = struct {
             } else if (!quiet) std.log.scoped(.dsv41).warn("engram: no io_uring ({t}) and TF_DSV41_ENGRAM_QD=0; rows are read when a window needs them", .{e});
             break :blk null;
         };
-        return r;
     }
 
     pub const startAio = engram_io.startAio;
     pub const startPool = engram_io.startPool;
     pub const stopPool = engram_io.stopPool;
+
+    /// Lazily starts background reader threads for bulk (>512-extent) prefill batches to avoid SQFull stalls.
+    pub fn ensureBulkPool(r: *Rows) void {
+        if (r.pool != null) return;
+        const n = poolThreads() catch return;
+        if (n == 0) return;
+        r.startPool(n) catch {};
+    }
     const worker = engram_io.worker;
     const openTable = engram_io.openTable;
     const closeTable = engram_io.closeTable;
@@ -192,7 +249,8 @@ pub const Rows = struct {
                     continue;
                 }
                 const s = t.take();
-                @memcpy(t.recs[s * row_bytes ..][0..row_bytes], b.record(k, t.h.lo));
+                const rb: usize = @intCast(t.h.row_bytes);
+                @memcpy(t.recs[s * rb ..][0..rb], b.record(k, t.file_lo));
                 t.ids[s] = x;
                 t.front(s);
                 // the entry is this batch's (a row is in one batch at most; evictions only remove ready entries)
@@ -205,10 +263,9 @@ pub const Rows = struct {
         }
     }
 
-    /// Layer `li`'s rows `idx` (global row ids this rank owns, any order, duplicates allowed) as bf16 [idx.len, dim].
-    pub fn rows(r: anytype, li: usize, idx: []const i64, dim: usize, out: []u16) !void {
-        if (dim > values or dim % 32 != 0 or out.len != idx.len * dim) return error.BadEngramRows;
+    fn fetchRecords(r: anytype, li: usize, idx: []const i64) !void {
         const t = &r.tables[li];
+        const rb: usize = @intCast(t.h.row_bytes);
         try r.unique(t, idx);
         try engram_io.recover(r);
         const u = r.uniq.items;
@@ -220,7 +277,7 @@ pub const Rows = struct {
         for (u, 0..) |x, k| {
             if (t.map.get(x)) |e| switch (e) {
                 .ready => |s| {
-                    r.recs.items[k] = t.recs[s * row_bytes ..].ptr;
+                    r.recs.items[k] = t.recs[s * rb ..].ptr;
                     t.unlink(s);
                     t.front(s);
                     r.stats.hits += 1;
@@ -250,9 +307,31 @@ pub const Rows = struct {
             .ready => {},
             .pending => |bi| {
                 const b = &r.batches.items[bi];
-                r.recs.items[k] = b.record(std.sort.binarySearch(u64, b.rows, x, orderU64).?, t.h.lo).ptr;
+                r.recs.items[k] = b.record(std.sort.binarySearch(u64, b.rows, x, orderU64).?, t.file_lo).ptr;
             },
         };
+    }
+
+    /// Layer `li`'s raw packed records `idx` (`[idx.len, row_bytes]`), any order, duplicates allowed.
+    pub fn rawRows(r: anytype, li: usize, idx: []const i64, out: []u8) !void {
+        if (li >= r.tables.len) return error.BadEngramRows;
+        const rb: usize = @intCast(r.tables[li].h.row_bytes);
+        if (out.len != try std.math.mul(usize, idx.len, rb)) return error.BadEngramRows;
+        try fetchRecords(r, li, idx);
+        const u = r.uniq.items;
+        for (idx, 0..) |i, p| {
+            const rec = r.recs.items[std.sort.binarySearch(u64, u, @as(u64, @intCast(i)), orderU64).?];
+            @memcpy(out[p * rb ..][0..rb], rec[0..rb]);
+        }
+        r.settle(li);
+    }
+
+    /// Layer `li`'s rows `idx` (global row ids this rank owns, any order, duplicates allowed) as bf16 [idx.len, dim].
+    pub fn rows(r: anytype, li: usize, idx: []const i64, dim: usize, out: []u16) !void {
+        if (li >= r.tables.len or r.tables[li].h.row_bytes != row_bytes) return error.BadEngramRows;
+        if (dim > values or dim % 32 != 0 or out.len != idx.len * dim) return error.BadEngramRows;
+        try fetchRecords(r, li, idx);
+        const u = r.uniq.items;
         // every position: its record's values through the table (scale byte of each 32 values, then the e4m3 byte)
         for (idx, 0..) |i, p| {
             const rec = r.recs.items[std.sort.binarySearch(u64, u, @as(u64, @intCast(i)), orderU64).?];

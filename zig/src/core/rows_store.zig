@@ -44,10 +44,10 @@ pub const State = struct {
     rows: u64,
     used: u64,
     shared: bool,
+    unreadable: bool = false,
 };
 
-/// A block file's bytes, and how many states name it.
-pub const Block = struct { bytes: u64, refs: u32 = 0 };
+pub const Block = struct { bytes: u64, refs: u32 = 0 }; // A block file's bytes, and how many states name it.
 
 pub const Counts = struct { written: u64 = 0, read: u64 = 0, reads: u64 = 0, writes: u64 = 0, skipped: u64 = 0, failed: u64 = 0, evicted: u64 = 0, verified: u64 = 0, differed: u64 = 0 };
 
@@ -155,7 +155,7 @@ pub const Rows = struct {
         write.stop(r, write.nowNs());
         if (r.fetch) |f| f.destroy();
         if (r.job) |j| write.abort(r, j);
-        for (r.queue.items) |q| r.gpa.free(q.starts);
+        for (r.queue.items) |q| q.drop(r.gpa);
         for (r.states.items) |*s| freeState(r.gpa, s);
         r.states.deinit(r.gpa);
         r.blocks.deinit(r.gpa);

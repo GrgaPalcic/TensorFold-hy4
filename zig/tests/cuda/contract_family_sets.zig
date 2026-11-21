@@ -22,6 +22,10 @@ pub const Sets = struct {
     shared_down: *SharedDown,
     prompt: *Prompt,
     joint_schema: *@import("contract_joint_schema.zig").Set,
+    hy4: *@import("contract_hy4.zig").Set,
+    hy4_mla: *@import("contract_hy4_mla.zig").Set,
+    hy4_index: *@import("contract_hy4_index.zig").Set,
+    hy4_wave1: *@import("contract_hy4_wave1.zig").Set,
 
     /// Each set's kernels appended to `list`, in this order.
     pub fn init(gpu: check.Gpu, s: cuda.Stream, a: std.mem.Allocator, list: *std.ArrayList(g.Kernel), affine4: *cuda.qlinear.Affine4Kernels, cap: u32) !Sets {
@@ -61,6 +65,14 @@ pub const Sets = struct {
         errdefer prompt.deinit();
         try prompt.append(cap, a, list);
         const joint_schema = try @import("contract_joint_schema.zig").Set.init(gpu, s, a, list);
+        errdefer joint_schema.deinit();
+        const hy4 = try @import("contract_hy4.zig").Set.init(gpu, s, a, list);
+        errdefer hy4.deinit();
+        const hy4_mla = try @import("contract_hy4_mla.zig").Set.init(gpu, s, a, list);
+        errdefer hy4_mla.deinit();
+        const hy4_index = try @import("contract_hy4_index.zig").Set.init(gpu, s, a, list);
+        errdefer hy4_index.deinit();
+        const hy4_wave1 = try @import("contract_hy4_wave1.zig").Set.init(gpu, s, a, list);
         return .{
             .gpa = gpu.gpa,
             .bf16_experts = bf16_experts,
@@ -75,10 +87,18 @@ pub const Sets = struct {
             .shared_down = shared_down,
             .prompt = prompt,
             .joint_schema = joint_schema,
+            .hy4 = hy4,
+            .hy4_mla = hy4_mla,
+            .hy4_index = hy4_index,
+            .hy4_wave1 = hy4_wave1,
         };
     }
 
     pub fn deinit(sets: Sets) void {
+        sets.hy4_wave1.deinit();
+        sets.hy4_index.deinit();
+        sets.hy4_mla.deinit();
+        sets.hy4.deinit();
         sets.joint_schema.deinit();
         sets.prompt.deinit();
         sets.gpa.destroy(sets.prompt);

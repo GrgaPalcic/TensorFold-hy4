@@ -191,7 +191,7 @@ test "request starts: one family's switch leaves every other family without star
         pub const snap_grid: u32 = 2048;
         pub const request_starts = true;
     };
-    const names = [_][:0]const u8{ "TF_QWEN_REQUEST_STARTS", "TF_GLM_REQUEST_STARTS", Other.request_starts_switch };
+    const names = [_][:0]const u8{ "TF_QWEN_REQUEST_STARTS", "TF_GLM_REQUEST_STARTS", "TF_HY4_REQUEST_STARTS", Other.request_starts_switch };
     var saved: [names.len]?[:0]u8 = @splat(null);
     for (names, &saved) |n, *s| if (sys.getenv(n)) |v| {
         s.* = try std.testing.allocator.dupeSentinel(u8, v, 0);
@@ -203,16 +203,17 @@ test "request starts: one family's switch leaves every other family without star
         _ = sys.env.unsetenv(n);
     };
     const registry = @import("cuda.zig").registry;
-    var named = [_]usize{ 0, 0 }; // registry entry points naming Qwen's switch, GLM's
+    var named = [_]usize{ 0, 0, 0 }; // registry entry points naming Qwen's switch, GLM's, Hy4's
     inline for (registry) |F| if (@hasDecl(F, "request_starts_switch")) {
         const glm = std.mem.eql(u8, F.request_starts_switch, names[1]);
-        try std.testing.expect(std.mem.startsWith(u8, F.model_type, if (glm) "glm5_next" else "qwen3_5"));
-        try std.testing.expect(glm or std.mem.eql(u8, F.request_starts_switch, names[0]));
+        const hy4 = std.mem.eql(u8, F.request_starts_switch, names[2]);
+        try std.testing.expect(std.mem.startsWith(u8, F.model_type, if (glm) "glm5_next" else if (hy4) "hy_v4_flash" else "qwen3_5"));
+        try std.testing.expect(glm or hy4 or std.mem.eql(u8, F.request_starts_switch, names[0]));
         const id = profile.registered(F.request_starts_switch) orelse return error.UnreviewedSwitch;
         try std.testing.expect(profile.entry(id).applies(F.model_type, "cuda"));
-        named[@intFromBool(glm)] += 1;
+        named[if (glm) 1 else if (hy4) 2 else 0] += 1;
     };
-    try std.testing.expectEqual([_]usize{ 2, 1 }, named); // Qwen's dense and MoE entry points, GLM's one
+    try std.testing.expectEqual([_]usize{ 2, 1, 1 }, named); // Qwen's dense and MoE entry points, GLM's one, Hy4's one
     for (0..names.len + 1) |on| { // on == names.len: every switch unset
         for (names, 0..) |n, i| try std.testing.expectEqual(@as(c_int, 0), if (i == on) sys.env.setenv(n, "1", 1) else sys.env.unsetenv(n));
         inline for (registry ++ .{ Other, Unnamed }) |F| {
@@ -220,7 +221,7 @@ test "request starts: one family's switch leaves every other family without star
             const grid: u32 = if (@hasDecl(F, "snap_grid")) F.snap_grid else 0;
             try std.testing.expect(!@hasDecl(F, "request_starts_switch") or grid > 0);
             try std.testing.expectEqual(if (opted) grid else 0, requestStep(F));
-            const glm = opted and on == 1; // GLM keeps 256 apart, as measured; Qwen and the test family keep every start
+            const glm = opted and on == 1; // GLM keeps 256 apart, as measured; Qwen, Hy4 and the test family keep every start
             try std.testing.expectEqual(@as(u32, if (opted and !glm) 1 else 256), requestMinimum(F));
         }
     }

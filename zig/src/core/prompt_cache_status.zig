@@ -84,57 +84,60 @@ pub fn PromptCache(s: *const pc.Store) status.PromptCache {
 
 /// The disk tier's copy (--learn-conversations), or null: no tier, nothing to show.
 pub fn Disk(s: *pc.Store) ?status.DiskCache {
-    if (s.disk) |r| {
-        var out = status.DiskCache{
-            .states = @intCast(r.states.items.len),
-            .held_bytes = r.held(),
-            .cap_bytes = r.cap,
-            .daily_cap_bytes = r.daily,
-            .queue_len = @intCast(r.queue.items.len),
-            .read_rate_bps = r.read_rate,
-            .read_ms_last = r.file_io.read_ms_last,
-            .read_ms_ema = r.file_io.read_ms_ema,
-            .write_ms_last = r.file_io.write_ms_last,
-            .write_ms_ema = r.file_io.write_ms_ema,
-            .read_ms_p50 = r.file_io.read_lat.percentile(0.5),
-            .read_ms_p95 = r.file_io.read_lat.percentile(0.95),
-            .write_ms_p50 = r.file_io.write_lat.percentile(0.5),
-            .write_ms_p95 = r.file_io.write_lat.percentile(0.95),
-            .last_read_ms = r.file_io.last_read_ms,
-            .last_write_ms = r.file_io.last_write_ms,
-            .written_bytes = r.counts.written,
-            .read_bytes = r.counts.read,
-            .reads = r.counts.reads,
-            .writes = r.counts.writes,
-            .skipped = r.counts.skipped,
-            .failed = r.counts.failed,
-            .evicted = r.counts.evicted,
-            .verified = r.counts.verified,
-            .differed = r.counts.differed,
-            .failure_count = r.failures.count,
-            .admission_retry_at = r.admission.retry_at,
-        };
-        if (r.failures.count > 0) {
-            if (r.failures.records[@intCast((r.failures.count - 1) % 64)]) |f| out.last_error = @errorName(f.err);
-        }
-        if (s.imprint) |im| {
-            out.imprint_states = @intCast(im.metas.items.len);
-            out.imprint_bytes = im.total();
-        }
-        if (r.fetch) |f| {
-            const c = f.snapshot();
-            out.prefetch_made = c.counts.made;
-            out.prefetch_used = c.counts.used;
-            out.prefetch_freed = c.counts.freed;
-            out.prefetch_failed = c.counts.failed;
-            out.prefetch_cancelled = c.counts.cancelled;
-            out.prefetch_timeouts = c.counts.timeouts;
-            out.prefetch_held_reads = @intCast(c.held_reads);
-            out.prefetch_held_bytes = c.held_bytes;
-        }
-        return out;
+    const r = s.disk orelse return null;
+    var out = DiskRows(r);
+    if (s.imprint) |im| {
+        out.imprint_states = @intCast(im.metas.items.len);
+        out.imprint_bytes = im.total();
     }
-    return null;
+    return out;
+}
+
+pub fn DiskRows(r: *const pc.rows.Rows) status.DiskCache {
+    var out = status.DiskCache{
+        .states = @intCast(r.states.items.len),
+        .held_bytes = r.held(),
+        .cap_bytes = r.cap,
+        .daily_cap_bytes = r.daily,
+        .queue_len = @intCast(r.queue.items.len),
+        .read_rate_bps = r.read_rate,
+        .read_ms_last = r.file_io.read_ms_last,
+        .read_ms_ema = r.file_io.read_ms_ema,
+        .write_ms_last = r.file_io.write_ms_last,
+        .write_ms_ema = r.file_io.write_ms_ema,
+        .read_ms_p50 = r.file_io.read_lat.percentile(0.5),
+        .read_ms_p95 = r.file_io.read_lat.percentile(0.95),
+        .write_ms_p50 = r.file_io.write_lat.percentile(0.5),
+        .write_ms_p95 = r.file_io.write_lat.percentile(0.95),
+        .last_read_ms = r.file_io.last_read_ms,
+        .last_write_ms = r.file_io.last_write_ms,
+        .written_bytes = r.counts.written,
+        .read_bytes = r.counts.read,
+        .reads = r.counts.reads,
+        .writes = r.counts.writes,
+        .skipped = r.counts.skipped,
+        .failed = r.counts.failed,
+        .evicted = r.counts.evicted,
+        .verified = r.counts.verified,
+        .differed = r.counts.differed,
+        .failure_count = r.failures.count,
+        .admission_retry_at = r.admission.retry_at,
+    };
+    if (r.failures.count > 0) {
+        if (r.failures.records[@intCast((r.failures.count - 1) % 64)]) |f| out.last_error = @errorName(f.err);
+    }
+    if (r.fetch) |f| {
+        const c = f.snapshot();
+        out.prefetch_made = c.counts.made;
+        out.prefetch_used = c.counts.used;
+        out.prefetch_freed = c.counts.freed;
+        out.prefetch_failed = c.counts.failed;
+        out.prefetch_cancelled = c.counts.cancelled;
+        out.prefetch_timeouts = c.counts.timeouts;
+        out.prefetch_held_reads = @intCast(c.held_reads);
+        out.prefetch_held_bytes = c.held_bytes;
+    }
+    return out;
 }
 
 test {

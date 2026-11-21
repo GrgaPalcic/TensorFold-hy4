@@ -33,11 +33,15 @@ pub fn ask(ctx: *anyopaque, a: *api.ImprintAsk) bool {
     return true;
 }
 
+fn diskOf(h: *const LaneHost) ?*rows.Rows {
+    return if (h.cache) |store| store.disk else h.disk.rows;
+}
+
 /// Every queued ask answered (between rounds, on the engine thread).
 pub fn answer(h: *LaneHost) void {
-    if (h.cache) |store| if (store.disk) |r| {
+    if (diskOf(h)) |r| {
         if (!r.sync_writes) _ = rows.write.step(r);
-    };
+    }
     h.lock();
     const list = h.disk.take(h.gpa);
     h.unlock();
@@ -52,8 +56,7 @@ pub fn close(h: *LaneHost) void {
 
 /// Idle work waits; the synchronous writer also waits for the admission quiet (under the lock).
 pub fn ready(h: *LaneHost) bool {
-    const store = h.cache orelse return false;
-    const r = store.disk orelse return false;
+    const r = diskOf(h) orelse return false;
     if (!rows.write.ready(r)) return false;
     if (h.queued.items.len > 0 or h.admitted.items.len > 0 or h.cancels.items.len > 0 or h.closing) return false;
     return !r.sync_writes or h.disk.quiet(h.admissions, std.Io.Clock.awake.now(h.io).toNanoseconds());
@@ -61,7 +64,7 @@ pub fn ready(h: *LaneHost) bool {
 
 /// Stage one queued image or advance the synchronous writer, outside the lock.
 pub fn step(h: *LaneHost) void {
-    _ = rows.write.step(h.cache.?.disk.?);
+    _ = rows.write.step(diskOf(h).?);
 }
 
 /// The engine loop's idle turn (under the lock): when `ready`, the lock let go and one block written; true if so.
@@ -74,15 +77,13 @@ pub fn idle(h: *LaneHost) bool {
 
 /// The engine thread's last act on a stop: what waits is written under `stop_ns`, and --learn's half-made cut settled.
 pub fn flush(h: *LaneHost) void {
-    const store = h.cache orelse return;
-    if (store.imprint) |im| @import("prompt_learn.zig").settle(store, im);
-    const r = store.disk orelse return;
+    if (h.cache) |store| if (store.imprint) |im| @import("prompt_learn.zig").settle(store, im);
+    const r = diskOf(h) orelse return;
     _ = rows.write.drain(r, rows.write.nowNs() + stop_ns);
 }
 
 /// A prompt pass's tokens and time, for the store's choice between a disk read and prefilling.
 pub fn prefilled(h: *LaneHost, tokens: usize, ns: i96) void {
-    const store = h.cache orelse return;
-    const r = store.disk orelse return;
+    const r = diskOf(h) orelse return;
     r.prefilled(tokens, ns);
 }

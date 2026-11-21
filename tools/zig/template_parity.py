@@ -537,7 +537,8 @@ def main():
     corpus = build(found, args.fuzz, args.seed)
     corpus_path, results_path = args.out / "corpus.json", args.out / "results.json"
     corpus_path.write_text(json.dumps(corpus, ensure_ascii=False))
-    subprocess.run([args.zig, "run", "-lc", "-OReleaseSafe", str(ROOT / "zig/src/core/template/parity.zig"), "--", str(corpus_path), str(results_path)], check=True)
+    subprocess.run([args.zig, "run", "-lc", "-OReleaseSafe", "--dep", "sys", "-Mroot=" + str(ROOT / "zig/src/core/template/parity.zig"),
+                    "-Msys=" + str(ROOT / "zig/src/platform/sys.zig"), "--", str(corpus_path), str(results_path)], check=True)
     labels = {key: entry["labels"] for key, entry in found.items()}
     report, mismatches = compare(corpus, json.loads(results_path.read_text(encoding="utf-8")), labels)
     (args.out / "report.json").write_text(json.dumps({"python": sys.version.split()[0], "templates": report, "mismatches": mismatches}, ensure_ascii=False, indent=1))

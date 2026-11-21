@@ -4,7 +4,7 @@ const json = @import("json");
 const Value = json.Value;
 const Allocator = std.mem.Allocator;
 
-pub const Markers = struct { open: []const u8, close: []const u8 };
+pub const Markers = struct { open: []const u8, close: []const u8, self_open: ?[]const u8 = null, openers: ?Openers = null };
 /// Qwen's prompt opens the think block; Gemma 4's reply opens its thought channel.
 pub const think_markers: Markers = .{ .open = "", .close = "</think>" };
 /// MiniMax-M3's adaptive thinking: the reply writes `<mm:think>...</mm:think>` itself, or `</mm:think>` alone.
@@ -13,7 +13,7 @@ pub const mm_markers: Markers = .{ .open = "", .close = "</mm:think>" };
 const think_open = "<think>";
 
 fn openerOf(m: Markers) []const u8 {
-    return if (std.mem.eql(u8, m.close, mm_markers.close)) "<mm:think>" else think_open;
+    return m.self_open orelse if (std.mem.eql(u8, m.close, mm_markers.close)) "<mm:think>" else think_open;
 }
 pub const channel_markers: Markers = .{ .open = "<|channel>thought", .close = "<channel|>" };
 /// (opener, closer) of a tool call's markup: Qwen's, Gemma 4's, DeepSeek-V4's DSML block, LFM2's, V4.1's spaced DSML.
@@ -36,9 +36,9 @@ const mm_calls = calls ++ [_][2][]const u8{.{ "]<]minimax[>[<tool_call>", "]<]mi
 const mm_leads = leads ++ [_][]const []const u8{&.{}};
 const mm_openers: Openers = .{ .calls = &mm_calls, .leads = &mm_leads };
 
-/// The openers for a server's markers: MiniMax-M3's block only where the markers are MiniMax-M3's.
+/// The openers for a server's markers: MiniMax-M3's or Hy4's block only where those markers are active.
 pub fn openersOf(m: Markers) Openers {
-    return if (std.mem.eql(u8, m.close, mm_markers.close)) mm_openers else shared_openers;
+    return m.openers orelse if (std.mem.eql(u8, m.close, mm_markers.close)) mm_openers else shared_openers;
 }
 
 /// Whether the text after an opener is a call's payload, may still become one, or is prose that names the opener.
@@ -194,7 +194,7 @@ pub fn splitThinkingAt(a: Allocator, full: []const u8, finished: bool, m: Marker
 /// Hides tool-call blocks and partial opening tags while streaming, so calls arrive as deltas instead.
 pub fn hideToolCalls(a: Allocator, text: []const u8, finished: bool) Allocator.Error![]const u8 {
     var out: std.ArrayList(u8) = .empty;
-    return hideInto(a, &out, text, finished, false, shared_openers);
+    return hideInto(a, &out, text, finished, false, try @import("tool_hy4.zig").openersIn(a, text));
 }
 
 /// ``hideToolCalls`` into ``out`` (cleared first) for openers ``o``; text without a call block is a slice of ``text``.
@@ -203,7 +203,7 @@ pub fn hideInto(a: Allocator, out: *std.ArrayList(u8), text: []const u8, finishe
     var pos: usize = 0;
     var search: usize = 0;
     var code: @import("reply_code.zig").Scanner = .{};
-    var next_buf: [mm_calls.len]?usize = undefined; // each opener at or after `search`, re-searched when passed
+    var next_buf: [calls.len + 4]?usize = undefined; // each opener at or after `search`, re-searched when passed
     const next = next_buf[0..o.calls.len];
     for (o.calls, next) |c, *n| n.* = findTag(text, 0, c[0]);
     while (true) {
@@ -271,7 +271,7 @@ pub fn finishedProse(a: Allocator, text: []const u8) Allocator.Error![]const u8 
     // attachCalls has not yet decided whether to strip the reply's content.
     if (pyLstrip(text).len != text.len) return text[0..0];
     var out: std.ArrayList(u8) = .empty;
-    const prose = try hideInto(a, &out, text, true, true, shared_openers);
+    const prose = try hideInto(a, &out, text, true, true, try @import("tool_hy4.zig").openersIn(a, text));
     return if (prose.len != text.len) prose[0..pyRstrip(prose).len] else prose;
 }
 

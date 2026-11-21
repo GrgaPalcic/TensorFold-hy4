@@ -5,3 +5,5 @@
 #include "contract_dense_controls.cuh"
 #include "contract_experts_bf16_controls.cuh"
 #include "contract_nemo_audio_controls.cuh"
+#include "hy4_mla_controls.cuh"
+#include "hy4_index_controls.cuh"

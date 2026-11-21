@@ -111,43 +111,43 @@ last two hold the families with only a Metal, HIP or scoring backend.
 | 28. Scale index | ? | ? | ? | ? | ? |
 | 29. DSpine | no (no drafter) | no (no drafter) | no (no drafter) | no (no drafter) | no (no drafter) |
 
-| Optimization | lfm2m | lfm3 | qwen4 | ling |
-| --- | --- | --- | --- | --- |
-| 1. Prompt tail | no (no CUDA) | no (no CUDA) | no (n/a) | no (no engine) |
-| 2. Paged KV | open [#1503] | yes | yes | yes |
-| 3. Prompt store | open [#1503] | yes | yes | yes |
-| 4. iGPU states | yes | yes | yes | yes |
-| 5. State walk | yes | yes | yes | yes |
-| 6. KV ledger | yes | yes | yes | yes |
-| 7. Host KV tier | yes | yes | yes | yes |
-| 8. Disk cache | yes | yes | yes | yes |
-| 9. FP8 KV | yes | yes | yes | yes |
-| 10. FP4/FP8 decode | no (affine) | yes | yes | no (EXL3) |
-| 11. Fused proj. | yes | done¹ | done¹ | yes |
-| 12. Add + norm | done M[#822] | done X[#1696] | yes | yes |
-| 13. MoE grouped | done M[#822] | no (dense) | no (dense) | done M[#1836] |
-| 14. CUDA graphs | yes | yes | yes | yes |
-| 15. MTP | no (no head) | no (no head) | no (no head) | yes |
-| 16. DFlash(2) | yes | yes | yes | yes |
-| 17. DSpark | open [#1394] | yes | yes | yes |
-| 18. Copy drafts | done M¹ | done X[#1696] | done¹ | yes |
-| 19. Shared drafts | done [#1779] | no (no head) | no (no head) | yes |
-| 20. Solo chunks | yes | yes | yes | yes |
-| 21. Read-ahead | no (no CUDA) | yes | yes | yes |
-| 22. Direct load | yes | yes | yes | yes |
-| 23. Page drop | done M[#1885] | yes | done [#1887] | yes |
-| 24. L2 prefetch | yes | yes | yes | yes |
-| 25. TP ranks | yes | no (1.7B) | yes | yes [#850] |
-| 26. Pipeline | yes | no (1.7B) | yes | yes |
-| 27. Profiles | yes | yes | yes | yes |
-| 28. Scale index | ? | ? | ? | ? |
-| 29. DSpine | no (no drafter) | no (no drafter) | no (no drafter) | no (no drafter) |
+| Optimization | lfm2m | lfm3 | qwen4 | ling | hy4 |
+| --- | --- | --- | --- | --- | --- |
+| 1. Prompt tail | no (no CUDA) | no (no CUDA) | no (n/a) | no (no engine) | yes |
+| 2. Paged KV | open [#1503] | yes | yes | yes | yes (slots) |
+| 3. Prompt store | open [#1503] | yes | yes | yes | yes (copy store) |
+| 4. iGPU states | yes | yes | yes | yes | done¹ |
+| 5. State walk | yes | yes | yes | yes | yes |
+| 6. KV ledger | yes | yes | yes | yes | done¹ |
+| 7. Host KV tier | yes | yes | yes | yes | yes |
+| 8. Disk cache | yes | yes | yes | yes | done¹ |
+| 9. FP8 KV | yes | yes | yes | yes | done¹ |
+| 10. FP4/FP8 decode | no (affine) | yes | yes | no (EXL3) | done¹ (FP8 TMA) |
+| 11. Fused proj. | yes | done¹ | done¹ | yes | done¹ |
+| 12. Add + norm | done M[#822] | done X[#1696] | yes | yes | done¹ (iHC) |
+| 13. MoE grouped | done M[#822] | no (dense) | no (dense) | done M[#1836] | done¹ |
+| 14. CUDA graphs | yes | yes | yes | yes | done¹ |
+| 15. MTP | no (no head) | no (no head) | no (no head) | yes | done¹ (DFly2) |
+| 16. DFlash(2) | yes | yes | yes | yes | done¹ (DFly2) |
+| 17. DSpark | open [#1394] | yes | yes | yes | yes |
+| 18. Copy drafts | done M¹ | done X[#1696] | done¹ | yes | done¹ |
+| 19. Shared drafts | done [#1779] | no (no head) | no (no head) | yes | yes |
+| 20. Solo chunks | yes | yes | yes | yes | yes |
+| 21. Read-ahead | no (no CUDA) | yes | yes | yes | done¹ (Engram) |
+| 22. Direct load | yes | yes | yes | yes | done¹ (Engram) |
+| 23. Page drop | done M[#1885] | yes | done [#1887] | yes | done¹ |
+| 24. L2 prefetch | yes | yes | yes | yes | yes |
+| 25. TP ranks | yes | no (1.7B) | yes | yes [#850] | done¹ (TP=2/4) |
+| 26. Pipeline | yes | no (1.7B) | yes | yes | yes |
+| 27. Profiles | yes | yes | yes | yes | done¹ |
+| 28. Scale index | ? | ? | ? | ? | ? |
+| 29. DSpine | no (no drafter) | no (no drafter) | no (no drafter) | no (no drafter) | no (DFly2) |
 
 q3.5 `qwen3_5` (C, M, H, X), fnext `flashnext` (C, M, H), glm `glm` (C, M), gem4 `gemma4` (C, M, X),
 nemo `nemotron` (C, M, H, X), kol1 `kolibri1` (C), spk25 `spark25` (C, M),
 dory `dory` (C), mm3 `minimax_m3` (C, M), dsv41 `deepseek_v41` (its own CUDA binary, not the release's CUDA server;
 M), lfm2m `lfm2_moe` (M; C on [#1492]), lfm3 `lfm3` (X; C on [#1508]), qwen4 `qwen4` (C, M),
-ling `ling` (host package only, no engine yet; CUDA plan in [#850]).
+ling `ling` (host package only, no engine yet; CUDA plan in [#850]), hy4 `hy4` (C).
 
 | Optimization | q27 | lfm2 | llama | step5 |
 | --- | --- | --- | --- | --- |

@@ -1,8 +1,6 @@
 //! GPU test runner for the CUDA runtime: `tf-cuda-test <command> [args]`, PASS/FAIL/RESULT lines, exit 1 on failure.
 
 const std = @import("std");
-const q27_back_tests = @import("q27_back_tests.zig");
-const q27_gemm_tests = @import("q27_gemm_tests.zig");
 const cuda = @import("cuda");
 const check = @import("check.zig");
 const dump = @import("byte_dump.zig");
@@ -16,8 +14,6 @@ const sample_tests = @import("sample_tests.zig");
 const glue_tests = @import("glue_tests.zig");
 const resume_tests = @import("resume_tests.zig");
 const prompt_cuts = @import("prompt_cuts.zig");
-const shared_fork = @import("shared_fork.zig");
-const grouped_tests = @import("grouped_tests.zig");
 const fp8_tests = @import("fp8_tests.zig");
 const mxfp8_tests = @import("mxfp8_tests.zig");
 const projection_f32_tests = @import("projection_f32_tests.zig");
@@ -44,28 +40,18 @@ const exl3_candidate_tests = @import("exl3_candidate_tests.zig");
 const experts3_tests = @import("experts3_tests.zig");
 const moe_tests = @import("moe_tests.zig");
 const ck_tests = @import("ck_tests.zig");
-const train_pack = @import("train_pack.zig");
 const exlr8_tests = @import("exlr8_tests.zig");
 const exlr8_dense_tests = @import("exlr8_dense_tests.zig");
 const norms_tests = @import("norms_tests.zig");
 const norm_rows_tests = @import("norm_rows_tests.zig");
 const norm_tail_tests = @import("norm_tail_tests.zig");
 const embed_tests = @import("embed_tests.zig");
-const pocket_tests = @import("pocket_tests.zig");
-const recapture_tests = @import("recapture_tests.zig");
 const contract_tests = @import("contract_tests.zig");
 const qmm_prefill_many_contract = @import("contract_qmm_prefill_many.zig");
-const lfm2_attention_tests = @import("lfm2_attention_tests.zig");
 const lfm2_kernel_tests = @import("lfm2_kernel_tests.zig");
-const lfm2_vision_tests = @import("lfm2_vision_tests.zig");
 const radio_tests = @import("radio_tests.zig");
 const glm_lanes_tests = @import("glm_lanes_tests.zig");
-const glm_pair_tests = @import("glm_pair_tests.zig");
-const glm_split_tests = @import("glm_split_tests.zig");
-const glm_solo_tests = @import("glm_solo_tests.zig");
-const glm_paged_tests = @import("glm_paged_tests.zig");
 const glm_kv_host_slots = @import("glm_kv_host_slots.zig");
-const glm_tap_tests = @import("glm_tap_tests.zig");
 const glm_synth = @import("glm_synth.zig");
 const tree_round_tests = @import("tree_round_tests.zig");
 const tree_tests = @import("tree_tests.zig");
@@ -80,8 +66,6 @@ const window_bench = @import("window_bench.zig");
 const moe_glue_tests = @import("moe_glue_tests.zig");
 const dense_rows_tests = @import("dense_rows_tests.zig");
 
-const experts_rows_tests = @import("experts_rows_tests.zig");
-const route_rows_tests = @import("route_rows_tests.zig");
 const flashnext_model_rank_tests = @import("flashnext_model_rank_tests.zig");
 const flashnext_fidelity_tests = @import("flashnext_fidelity_tests.zig");
 const flashnext_window_tests = @import("flashnext_window_tests.zig");
@@ -100,9 +84,6 @@ const flashnext_dense_hc_tests = @import("flashnext_dense_hc_tests.zig");
 const flashnext_hc_tests = @import("flashnext_hc_tests.zig");
 const flashnext_attn_tests = @import("flashnext_attn_tests.zig");
 const ggml_tests = @import("ggml_tests.zig");
-const paged_tests = @import("paged_tests.zig");
-const glm_loader_gate = @import("glm_loader_gate.zig");
-const glm_fp8g_shares = @import("glm_fp8g_shares.zig");
 
 const gdn_back_tests = @import("gdn_back_tests.zig");
 const q4_back_tests = @import("q4_back_tests.zig");
@@ -112,10 +93,7 @@ const attn_back_tests = @import("attn_back_tests.zig");
 const fn_hc_back_tests = @import("fn_hc_back_tests.zig");
 const fn_pocket_tests = @import("fn_pocket_tests.zig");
 const kolibri_tests = @import("kolibri_tests.zig");
-const dory_tests = @import("dory_tests.zig");
 const kolibri_layer_tests = @import("kolibri_layer_tests.zig");
-const aot_fallback_tests = @import("aot_fallback_tests.zig");
-const qwen_draft_frames = @import("qwen_draft_frames.zig");
 
 const usage =
     \\usage: tf-cuda-test <command>
@@ -296,6 +274,15 @@ const usage =
     \\  gemma4-pages MODEL TEXT N [DRAFTER]  Gemma 4: global caches in pool pages == linear ones, replies and logits
     \\  gemma4-ple                         Gemma 4 E-series: per-layer input rows bit-equal to the host steps
     \\  gemma4-e4b-force MODEL REF OUT NAME...  Gemma 4 E4B: a reference's tokens forced, logits as .npy
+    \\  hy4-hc MODEL FIXTURE         Hy4-flash's iHC mixes and merges on a layer fixture (tools/zig/hy4_reference.py)
+    \\  hy4-mlp MODEL FIXTURE...     Hy4-flash's dense MLP and LatentMoE at world 1, 2 and 4 on layer fixtures
+    \\  hy4-mla MODEL FIXTURE...     Hy4-flash's gated MLA from attn_in16 at world 1, 2 and 4 against fp64 and bf16
+    \\  hy4-mla-contract             Hy4-flash's MLA kernels (absorb, attention with sinks, value, post) through gates 1-5
+    \\  hy4-engram MODEL ENGRAM_DIR FIXTURE...  Hy4-flash's Engram (NVMe & resident, world 1, 2 and 4) on layer fixtures
+    \\  hy4-index MODEL FIXTURE...   Hy4-flash's compressed indexer + gated MLA at world 1, 2 and 4 with cut=2051 parity
+    \\  hy4-index-contract           Hy4-flash's compressed-indexer kernels through gates 1-5 with planted controls
+    \\  hy4-head MODEL FIXTURE...    Hy4-flash's embed_tokens, hc_head, final norm and sharded fp32 lm_head
+    \\  hy4-layers MODEL FIXTURE...  Hy4-flash's full DecoderLayer and multi-layer chain at world 1, 2 and 4
     \\  kolibri-reference MODEL IDS  Kolibri-1's layer 0 and head against float64 from the checkpoint (prompt and decode rows)
     \\  kolibri-layers MODEL IDS    Kolibri-1's window edge (513 keys) and its fifth layer's full reach, on the checkpoint
     \\  kolibri-full MODEL IDS N    Kolibri-1: eager rows, steps, drafted, sampled, shared rounds, cuts and kept states alike
@@ -359,10 +346,10 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "compile-contract-glue")) return compileContractGlue();
     if (std.mem.eql(u8, cmd, "qwen-draft-frames")) {
         if (rest.len != 4) return error.FrameGateArguments;
-        return qwen_draft_frames.run(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try arg(rest, 3));
+        return @import("qwen_draft_frames.zig").run(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try arg(rest, 3));
     }
-    if (std.mem.eql(u8, cmd, "experts-rows")) return experts_rows_tests.run(gpu);
-    if (std.mem.eql(u8, cmd, "route-rows")) return route_rows_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "experts-rows")) return @import("experts_rows_tests.zig").run(gpu);
+    if (std.mem.eql(u8, cmd, "route-rows")) return @import("route_rows_tests.zig").run(gpu);
     if (std.mem.eql(u8, cmd, "flashnext-fidelity-single")) return flashnext_fidelity_tests.runSingle(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), false);
     if (std.mem.eql(u8, cmd, "flashnext-fidelity-single-serial")) return flashnext_fidelity_tests.runSingle(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), true);
     if (std.mem.eql(u8, cmd, "flashnext-fidelity-rank")) return flashnext_fidelity_tests.run(gpu, try arg(rest, 0), try std.fmt.parseInt(usize, try arg(rest, 1), 10), try std.fmt.parseInt(u16, try arg(rest, 2), 10), try arg(rest, 3), try arg(rest, 4));
@@ -494,9 +481,9 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
         return;
     }
     if (std.mem.eql(u8, cmd, "pocket"))
-        return pocket_tests.run(gpu, if (rest.len > 0) try std.fmt.parseInt(usize, rest[0], 10) else 0);
-    if (std.mem.eql(u8, cmd, "lfm2-attention")) return lfm2_attention_tests.run(gpu);
-    if (std.mem.eql(u8, cmd, "lfm2-vision")) return lfm2_vision_tests.run(gpu, if (rest.len > 0) rest[0] else null);
+        return @import("pocket_tests.zig").run(gpu, if (rest.len > 0) try std.fmt.parseInt(usize, rest[0], 10) else 0);
+    if (std.mem.eql(u8, cmd, "lfm2-attention")) return @import("lfm2_attention_tests.zig").run(gpu);
+    if (std.mem.eql(u8, cmd, "lfm2-vision")) return @import("lfm2_vision_tests.zig").run(gpu, if (rest.len > 0) rest[0] else null);
     if (std.mem.eql(u8, cmd, "radio")) return radio_tests.run(gpu, try arg(rest, 0), try arg(rest, 1));
     if (std.mem.eql(u8, cmd, "radio-processor")) return radio_tests.processor(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2));
     if (std.mem.eql(u8, cmd, "radio-kernels")) return radio_tests.kernels(gpu);
@@ -510,16 +497,16 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "prompt-cuts")) return prompt_cuts.run(gpu, try arg(rest, 0), try arg(rest, 1));
     if (std.mem.eql(u8, cmd, "prompt-segments")) return prompt_cuts.segments(gpu, try arg(rest, 0), try arg(rest, 1));
     if (std.mem.eql(u8, cmd, "cached-plans-tp2")) return @import("shared_plans.zig").tp2(gpu, try arg(rest, 0), try arg(rest, 1));
-    if (std.mem.eql(u8, cmd, "shared-fork")) return shared_fork.run(gpu, try arg(rest, 0));
-    if (std.mem.eql(u8, cmd, "recapture")) return recapture_tests.run(gpu, try arg(rest, 0));
-    if (std.mem.eql(u8, cmd, "paged")) return paged_tests.run(gpu, try arg(rest, 0), try arg(rest, 1));
-    if (std.mem.eql(u8, cmd, "grouped-plan")) return grouped_tests.plan(gpu, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "shared-fork")) return @import("shared_fork.zig").run(gpu, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "recapture")) return @import("recapture_tests.zig").run(gpu, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "paged")) return @import("paged_tests.zig").run(gpu, try arg(rest, 0), try arg(rest, 1));
+    if (std.mem.eql(u8, cmd, "grouped-plan")) return @import("grouped_tests.zig").plan(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "carveout")) {
         const mib = if (rest.len > 0) try std.fmt.parseInt(usize, rest[0], 10) else cuda.carveout.default_bytes >> 20;
         return carveout_tests.run(gpu, if (rest.len > 1) rest[1] else cuda.carveout.default_card, mib);
     }
-    if (std.mem.eql(u8, cmd, "q27-back")) return q27_back_tests.run(gpu, .all);
-    if (std.mem.eql(u8, cmd, "q27-gemm")) return q27_gemm_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "q27-back")) return @import("q27_back_tests.zig").run(gpu, .all);
+    if (std.mem.eql(u8, cmd, "q27-gemm")) return @import("q27_gemm_tests.zig").run(gpu);
     if (std.mem.eql(u8, cmd, "gdn-back-27b")) return gdn_back_tests.runShape(gpu, 5120, 64);
     if (std.mem.eql(u8, cmd, "kernel-contract")) return contract_tests.run(gpu, rest);
     if (std.mem.eql(u8, cmd, "gb10-grouped-contract")) return @import("contract_gb10_many.zig").runAll(gpu);
@@ -549,34 +536,35 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "window-bench")) return window_bench.run(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "moe-glue")) return moe_glue_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "dense-rows")) return dense_rows_tests.run(gpu);
-    if (std.mem.eql(u8, cmd, "train-pack")) return train_pack.run(gpu, try arg(rest, 0), try arg(rest, 1), if (rest.len > 2) try std.fmt.parseInt(usize, rest[2], 10) else 24);
+    if (std.mem.eql(u8, cmd, "train-pack")) return @import("train_pack.zig").run(gpu, try arg(rest, 0), try arg(rest, 1), if (rest.len > 2) try std.fmt.parseInt(usize, rest[2], 10) else 24);
     if (std.mem.eql(u8, cmd, "glm-lanes-cover")) return glm_lanes_tests.coverCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
-    if (std.mem.eql(u8, cmd, "glm-paged-check")) return glm_paged_tests.pagedCheck(gpu, try arg(rest, 0), try std.fmt.parseInt(c_int, try arg(rest, 1), 10), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try arg(rest, 3));
+    if (std.mem.eql(u8, cmd, "glm-paged-check")) return @import("glm_paged_tests.zig").pagedCheck(gpu, try arg(rest, 0), try std.fmt.parseInt(c_int, try arg(rest, 1), 10), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try arg(rest, 3));
     if (std.mem.eql(u8, cmd, "glm-shared-check")) return glm_lanes_tests.sharedCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
-    if (std.mem.eql(u8, cmd, "glm-pair-check")) return glm_pair_tests.pairCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
-    if (std.mem.eql(u8, cmd, "glm-split-check")) return glm_split_tests.splitCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
-    if (std.mem.eql(u8, cmd, "glm-solo-check")) return glm_solo_tests.soloCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
-    if (std.mem.eql(u8, cmd, "glm-tap-split-check")) return glm_tap_tests.tapSplitCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
+    if (std.mem.eql(u8, cmd, "glm-pair-check")) return @import("glm_pair_tests.zig").pairCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
+    if (std.mem.eql(u8, cmd, "glm-split-check")) return @import("glm_split_tests.zig").splitCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
+    if (std.mem.eql(u8, cmd, "glm-solo-check")) return @import("glm_solo_tests.zig").soloCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
+    if (std.mem.eql(u8, cmd, "glm-tap-split-check")) return @import("glm_tap_tests.zig").tapSplitCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
     if (std.mem.eql(u8, cmd, "glm-synth")) {
         const kind = if (rest.len > 1) std.meta.stringToEnum(glm_synth.Kind, rest[1]) orelse return error.UnknownCommand else .nvfp4;
         return glm_synth.run(gpu, try arg(rest, 0), kind);
     }
-    if (std.mem.eql(u8, cmd, "glm-loader-gate")) return glm_loader_gate.run(gpu, try arg(rest, 0));
-    if (std.mem.eql(u8, cmd, "glm-fp8g-shares")) return glm_fp8g_shares.run(gpu);
+    if (std.mem.eql(u8, cmd, "glm-loader-gate")) return @import("glm_loader_gate.zig").run(gpu, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "glm-fp8g-shares")) return @import("glm_fp8g_shares.zig").run(gpu);
     if (std.mem.startsWith(u8, cmd, "dory-")) return @import("dory_serve_tests.zig").run(gpu, cmd, rest);
     if (std.mem.eql(u8, cmd, "gemma4-states")) return @import("gemma4_states_tests.zig").states(gpu, rest);
     if (std.mem.eql(u8, cmd, "spark25-pages")) return @import("spark25_pages_tests.zig").pages(gpu, rest);
     if (std.mem.eql(u8, cmd, "gemma4-pages")) return @import("gemma4_pages_tests.zig").pages(gpu, rest);
     if (std.mem.eql(u8, cmd, "gemma4-ple")) return @import("gemma4_ple_tests.zig").run(gpu);
     if (std.mem.eql(u8, cmd, "gemma4-e4b-force")) return @import("gemma4_e4b_force.zig").run(gpu, rest);
-    if (std.mem.eql(u8, cmd, "dory")) return dory_tests.greedy(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try arg(rest, 3));
+    if (std.mem.eql(u8, cmd, "dory")) return @import("dory_tests.zig").greedy(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try arg(rest, 3));
+    if (std.mem.startsWith(u8, cmd, "hy4-")) return @import("hy4_tests.zig").run(gpu, cmd, rest);
     if (std.mem.eql(u8, cmd, "kolibri-reference")) return kolibri_layer_tests.reference(gpu, try arg(rest, 0), try arg(rest, 1));
     if (std.mem.eql(u8, cmd, "kolibri-layers")) return kolibri_layer_tests.layers(gpu, try arg(rest, 0), try arg(rest, 1));
     if (std.mem.eql(u8, cmd, "kolibri-full")) return kolibri_tests.full(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2));
     if (std.mem.eql(u8, cmd, "kolibri-pages")) return @import("kolibri_pages_tests.zig").pages(gpu, rest);
     if (std.mem.eql(u8, cmd, "kolibri-greedy")) return kolibri_tests.greedy(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try arg(rest, 3));
     if (std.mem.eql(u8, cmd, "kolibri-logits")) return kolibri_tests.logits(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), if (rest.len > 3) rest[3] else null);
-    if (std.mem.eql(u8, cmd, "aot-fallback")) return aot_fallback_tests.run(gpu, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "aot-fallback")) return @import("aot_fallback_tests.zig").run(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "glm-lanes-concurrent")) return glm_lanes_tests.concurrentCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
     std.debug.print("{s}", .{usage});
     return error.UnknownCommand;

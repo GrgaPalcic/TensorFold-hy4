@@ -32,6 +32,11 @@ pub fn covers(sms: []const u32, capability: u32) bool {
 }
 
 pub const qwen4_hc: []const u8 = if (available) &Blob("fatbin_qwen4_hc").bytes else &.{};
+pub const hy4_hc: []const u8 = if (available) &Blob("fatbin_hy4_hc").bytes else &.{};
+pub const hy4_ihc: []const u8 = if (available) &Blob("fatbin_hy4_ihc").bytes else &.{};
+pub const hy4_dfly2_glue: []const u8 = if (available) &Blob("fatbin_hy4_dfly2_glue").bytes else &.{};
+pub const hy4_engram: []const u8 = if (available) &Blob("fatbin_hy4_engram").bytes else &.{};
+pub const hy4_rows: []const u8 = if (available) &Blob("fatbin_hy4_rows").bytes else &.{};
 pub const qwen4_ple: []const u8 = if (available) &Blob("fatbin_qwen4_ple").bytes else &.{};
 pub const gemma4_ple: []const u8 = if (available) &Blob("fatbin_gemma4_ple").bytes else &.{};
 pub const qwen4_gdn: []const u8 = if (available) &Blob("fatbin_qwen4_gdn").bytes else &.{};
@@ -92,6 +97,11 @@ pub const window_rows: []const u8 = if (available) &Blob("fatbin_window_rows").b
 pub const window_pages: []const u8 = if (available) &Blob("fatbin_window_pages").bytes else &.{};
 pub const moe_glue: []const u8 = if (available) &Blob("fatbin_moe_glue").bytes else &.{};
 pub const mla: []const u8 = if (available) &Blob("fatbin_mla").bytes else &.{};
+pub const hy4_mla: []const u8 = if (available) &Blob("fatbin_hy4_mla").bytes else &.{};
+pub const hy4_mla_c2: []const u8 = if (available) &Blob("fatbin_hy4_mla_c2").bytes else &.{};
+pub const hy4_mla_attn: []const u8 = if (available) &Blob("fatbin_hy4_mla_attn").bytes else &.{};
+pub const hy4_index: []const u8 = if (available) &Blob("fatbin_hy4_index").bytes else &.{};
+pub const hy4_route: []const u8 = if (available) &Blob("fatbin_hy4_route").bytes else &.{};
 pub const dense_rows: []const u8 = if (available) &Blob("fatbin_dense_rows").bytes else &.{};
 pub const modelopt_pack: []const u8 = if (available) &Blob("fatbin_modelopt_pack").bytes else &.{};
 pub const glm_glue: []const u8 = if (available) &Blob("fatbin_glm_glue").bytes else &.{};

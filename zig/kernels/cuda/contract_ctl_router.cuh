@@ -49,3 +49,5 @@ extern "C" __global__ void __launch_bounds__(128)
     }
   }
 }
+
+#include "contract_ctl_hy4.cuh"

@@ -11,6 +11,7 @@ test {
     _ = @import("lane_halt_test.zig");
     _ = @import("prompt_cache.zig");
     _ = @import("prompt_radix.zig");
+    _ = @import("prompt_radix_disk_test.zig");
     _ = @import("prompt_imprint.zig");
     _ = @import("keepalive.zig");
     _ = @import("originals_test.zig");

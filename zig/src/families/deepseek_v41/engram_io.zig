@@ -17,6 +17,7 @@ const Extent = struct { off: u64, len: u64, at: usize, first: u32, count: u32 };
 
 pub const Batch = struct {
     table: u32,
+    row_bytes: u32 = @intCast(row_bytes),
     /// sorted unique global rows
     rows: []u64,
     ext: []Extent,
@@ -24,6 +25,7 @@ pub const Batch = struct {
     left: u32,
     failed: bool = false,
     in_use: bool = true,
+    pooled: bool = false,
     /// a `rows` call took at least half its rows (a bulk batch is read through once read); `taken`: this call's count
     read: bool = false,
     taken: u32 = 0,
@@ -38,8 +40,9 @@ pub const Batch = struct {
             if (b.ext[m].first <= k) a = m else z = m;
         }
         const e = b.ext[a];
-        const at = e.at + @as(usize, @intCast(header_bytes + (b.rows[k] - lo) * row_bytes - e.off));
-        return b.buf[at..][0..row_bytes];
+        const rb: u64 = b.row_bytes;
+        const at = e.at + @as(usize, @intCast(header_bytes + (b.rows[k] - lo) * rb - e.off));
+        return b.buf[at..][0..@intCast(rb)];
     }
 };
 
@@ -51,6 +54,8 @@ pub const Table = struct {
     fd: linux.fd_t,
     direct: bool,
     h: Header,
+    file_lo: u64 = 0,
+    align_bytes: u64 = sector,
     size: u64,
     map: std.AutoHashMapUnmanaged(u64, Entry) = .empty,
     /// cap records, their ids, and the LRU links (head: most recent)
@@ -128,7 +133,6 @@ pub const Aio = struct {
     poll: bool = false, // TF_DSV41_ENGRAM_POLL=1: a wait spins on io_getevents up to `poll_ns`, then sleeps
 
     pub const poll_ns: u64 = 20 * std.time.ns_per_ms;
-
     pub const depth: u32 = 1024;
 
     const Iocb = extern struct {
@@ -183,9 +187,9 @@ pub fn startAio(r: *Rows) !void {
     if (r.aio == null) r.aio = try Aio.init();
 }
 
-/// The reader threads (no io_uring): `n` workers waiting for extents.
+/// The reader threads (`n` workers waiting for extents; coexists with io_uring for bulk prefill batches).
 pub fn startPool(r: *Rows, n: u32) !void {
-    if (r.pool != null or r.ring != null or n == 0) return error.EngramPool;
+    if (r.pool != null or n == 0) return error.EngramPool;
     const p = try r.gpa.create(Pool);
     errdefer r.gpa.destroy(p);
     p.* = .{};
@@ -274,15 +278,14 @@ pub fn openTable(gpa: std.mem.Allocator, path: [:0]const u8, cap: u32) !Table {
     return tableStorage(gpa, fd, direct, h, st.size, cap);
 }
 pub fn tableStorage(gpa: std.mem.Allocator, fd: linux.fd_t, direct: bool, h: Header, size: u64, cap: u32) !Table {
-    const recs = try gpa.alloc(u8, try std.math.mul(usize, cap, row_bytes));
+    const recs = try gpa.alloc(u8, try std.math.mul(usize, cap, @intCast(h.row_bytes)));
     errdefer gpa.free(recs);
     const ids = try gpa.alloc(u64, cap);
     errdefer gpa.free(ids);
     const prev = try gpa.alloc(u32, cap);
     errdefer gpa.free(prev);
     const next = try gpa.alloc(u32, cap);
-    const t: Table = .{ .fd = fd, .direct = direct, .h = h, .size = size, .recs = recs, .ids = ids, .prev = prev, .next = next };
-    return t;
+    return .{ .fd = fd, .direct = direct, .h = h, .file_lo = h.lo, .size = size, .recs = recs, .ids = ids, .prev = prev, .next = next };
 }
 
 pub fn closeTable(r: *Rows, t: *Table) void {
@@ -294,10 +297,8 @@ pub fn closeTable(r: *Rows, t: *Table) void {
     r.gpa.free(t.next);
 }
 
-/// Recover failed destinations before callers classify cached/pending ids or remember reusable batch indices.
 pub fn recover(r: anytype) !void {
-    // A previously failed drain still owns its destinations and map entries until completion.
-    if (r.pool == null) for (r.batches.items, 0..) |*b, i| if (b.in_use and b.failed) {
+    for (r.batches.items, 0..) |*b, i| if (b.in_use and !b.pooled and b.failed) {
         try r.drain(@intCast(i));
         discard(r, @intCast(i));
     };
@@ -308,13 +309,15 @@ pub fn start(r: anytype, ti: u32, rows_in: []const u64, urgent: bool) !u32 {
     try recover(r);
     const t = &r.tables[ti];
     const gpa = r.gpa;
+    const rb = t.h.row_bytes;
+    const unit = t.align_bytes;
     var ext: std.ArrayList(Extent) = .empty;
     errdefer ext.deinit(gpa);
     var total: usize = 0;
     for (rows_in, 0..) |x, k| {
-        const s = header_bytes + (x - t.h.lo) * row_bytes;
-        const s0 = s / sector * sector;
-        const s1 = (s + row_bytes + sector - 1) / sector * sector;
+        const s = header_bytes + (x - t.file_lo) * rb;
+        const s0 = s / unit * unit;
+        const s1 = (s + rb + unit - 1) / unit * unit;
         if (ext.items.len > 0) {
             const e = &ext.items[ext.items.len - 1];
             if (s0 <= e.off + e.len + merge_gap) {
@@ -337,10 +340,15 @@ pub fn start(r: anytype, ti: u32, rows_in: []const u64, urgent: bool) !u32 {
     errdefer if (!published) gpa.free(owned);
     const extents = try ext.toOwnedSlice(gpa);
     errdefer if (!published) gpa.free(extents);
-    const b: Batch = .{ .table = ti, .rows = owned, .ext = extents, .buf = buf, .left = 0 };
+    var b: Batch = .{ .table = ti, .row_bytes = @intCast(rb), .rows = owned, .ext = extents, .buf = buf, .left = 0 };
     try t.map.ensureUnusedCapacity(gpa, @intCast(owned.len));
-    if (r.pool) |p| {
-        // the batch's slot and its extents queued under the pool's lock (a worker settles batches.items[bi])
+    const has_ring = @hasField(@TypeOf(r.*), "ring") and r.ring != null;
+    if (has_ring and extents.len > 512 and r.pool == null) {
+        if (@hasDecl(@TypeOf(r.*), "ensureBulkPool")) r.ensureBulkPool();
+    }
+    if (r.pool != null and (!has_ring or extents.len > 512)) {
+        const p = r.pool.?;
+        b.pooled = true;
         p.lock();
         const queued = r.queue(p, t, b, urgent);
         p.unlock();
@@ -350,7 +358,14 @@ pub fn start(r: anytype, ti: u32, rows_in: []const u64, urgent: bool) !u32 {
         for (owned) |x| t.map.putAssumeCapacity(x, .{ .pending = bi });
         return bi;
     }
-    const bi = try r.slotFor(b);
+    const bi = blk: {
+        if (r.pool) |p| {
+            p.lock();
+            defer p.unlock();
+            break :blk try r.slotFor(b);
+        }
+        break :blk try r.slotFor(b);
+    };
     published = true;
     errdefer {
         r.batches.items[bi].failed = true;
@@ -511,29 +526,26 @@ pub fn reap(r: *Rows, at_least: u32) !void {
     }
 }
 
-/// Completes every accepted or queued request. Errors leave the full owner published for retry/close.
+fn waitPool(r: *Rows, bi: u32) void {
+    const p = r.pool.?;
+    p.lock();
+    defer p.unlock();
+    while (r.batches.items[bi].left > 0) _ = std.c.pthread_cond_wait(&p.done, &p.mu);
+}
+
 pub fn drain(r: *Rows, bi: u32) !void {
-    if (r.pool) |p| {
-        p.lock();
-        defer p.unlock();
-        while (r.batches.items[bi].left > 0) _ = std.c.pthread_cond_wait(&p.done, &p.mu);
-        return;
-    }
-    if (r.ring) |*g| {
-        // Include SQEs not accepted by a failed/partial submit in the completion barrier.
-        while (g.sq_ready() > 0) _ = try g.submit();
-    }
+    if (r.batches.items[bi].pooled) return waitPool(r, bi);
+    if (r.ring) |*g| while (g.sq_ready() > 0) {
+        _ = try g.submit();
+    };
     while (r.batches.items[bi].left > 0) try r.reap(1);
 }
-/// Only a completed batch may relinquish its three arrays and pending map entries.
 pub fn discard(r: anytype, bi: u32) void {
     const b = &r.batches.items[bi];
     std.debug.assert(b.in_use and b.left == 0);
     const t = &r.tables[b.table];
     for (b.rows) |x| if (t.map.get(x)) |entry| switch (entry) {
-        .pending => |owner| if (owner == bi) {
-            t.drop(x);
-        },
+        .pending => |owner| if (owner == bi) t.drop(x),
         .ready => {},
     };
     r.gpa.free(b.rows);
@@ -541,17 +553,10 @@ pub fn discard(r: anytype, bi: u32) void {
     r.gpa.free(b.buf);
     b.in_use = false;
 }
-
-/// Blocks until batch `bi`'s reads are done.
 pub fn wait(r: *Rows, bi: u32) !void {
-    if (r.pool) |p| {
-        p.lock();
-        defer p.unlock();
-        while (r.batches.items[bi].left > 0) _ = std.c.pthread_cond_wait(&p.done, &p.mu);
-        if (r.batches.items[bi].failed) return error.EngramReadFailed;
-        return;
-    }
-    while (r.batches.items[bi].left > 0) try r.reap(1);
+    if (r.batches.items[bi].pooled) {
+        waitPool(r, bi);
+    } else while (r.batches.items[bi].left > 0) try r.reap(1);
     if (r.batches.items[bi].failed) return error.EngramReadFailed;
 }
 
@@ -573,17 +578,7 @@ pub fn readAt(fd: linux.fd_t, size: u64, direct: bool, buf: []u8, off: u64) !voi
 }
 
 pub fn preadAll(fd: linux.fd_t, out: []u8, off: u64) !void {
-    var done: usize = 0;
-    while (done < out.len) {
-        const rc = dio.pread(fd, out[done..].ptr, out.len - done, @intCast(off + done));
-        switch (linux.errno(rc)) {
-            .SUCCESS => {},
-            .INTR => continue,
-            else => return error.EngramReadFailed,
-        }
-        if (rc == 0) return error.EngramShortRead;
-        done += rc;
-    }
+    return readAt(fd, off + out.len, true, out, off);
 }
 
 pub fn nowNs() u64 {

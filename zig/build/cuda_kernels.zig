@@ -56,6 +56,11 @@ pub const kernels = [_]Kernel{
     .{ .name = "qwen4_projection", .flags = glue },
     .{ .name = "qwen4_gdn", .flags = glue },
     .{ .name = "qwen4_hc", .flags = glue },
+    .{ .name = "hy4_hc", .flags = glue }, // Hy4-flash's iHC mixes, merge and hc_head, fp32 with IEEE division and roots
+    .{ .name = "hy4_ihc", .flags = glue }, // ours: Hy4-flash b1 1-launch fused iHC boundary (ticket/coop/prefill)
+    .{ .name = "hy4_dfly2_glue", .flags = glue }, // ours: Hy4-flash b5 DFly2 5-layer drafter glue kernels
+    .{ .name = "hy4_engram", .flags = glue }, // Hy4-flash's Engram FP8 row RMSNorm, bias and 4-stream gate, IEEE fp32
+    .{ .name = "hy4_rows", .flags = &.{"-O3"} }, // ours: Hy4-flash's lm_head and router at 5+ rows, dense_rows' sums
     .{ .name = "qwen4_ple", .flags = glue },
     .{ .name = "attn_train", .flags = &.{"-O3"} },
     .{ .name = "qwen27_train", .flags = &.{"-O3"} },
@@ -141,6 +146,11 @@ pub const kernels = [_]Kernel{
     .{ .name = "window_pages", .flags = &.{"-O3"} }, // ours: window_rows.cuh over paged caches (Dory, Gemma 4, Spark)
     .{ .name = "moe_glue", .flags = &.{"-O3"} }, // ours: sigmoid top-k and the weighted combine (cuda/moe_glue.zig)
     .{ .name = "mla", .flags = &.{"-O3"} }, // ours: MLA, 64 roped columns and 128-wide heads, on GLM's chunk bodies
+    .{ .name = "hy4_mla", .flags = glue }, // ours: Hy4-flash's absorbed gated MLA with sinks (families/hy4/cuda_mla.zig)
+    .{ .name = "hy4_mla_c2", .flags = glue }, // ours: Hy4-flash c2 tensor-core absorb & expand+gate (TILED kv_b)
+    .{ .name = "hy4_mla_attn", .flags = glue }, // ours: Hy4-flash c1 tensor-core absorbed MLA attention (split+fold & batched rows)
+    .{ .name = "hy4_index", .flags = glue, .arch_specific = true }, // ours: Hy4-flash's compressed indexer (pool, score, top-k)
+    .{ .name = "hy4_route", .flags = glue }, // ours: Hy4-flash b4 multi-warp bitonic top-16 sigmoid router
     .{ .name = "dense_rows", .flags = &.{"-O3"} }, // ours: bf16 rows times weight rows into fp32 (cuda/dense_rows.zig)
     .{ .name = "modelopt_pack", .flags = &.{"-O3"} }, // ours: ModelOpt tensors into the lane, prompt and expert layouts
     .{ .name = "glm_kda", .flags = &.{ "-O3", "--fmad=false" } }, // GLM: the Python family's glm5_next/cuda/kda.cu

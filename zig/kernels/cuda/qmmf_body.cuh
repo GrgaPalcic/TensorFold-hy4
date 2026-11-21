@@ -8,7 +8,7 @@
 #ifdef TF_QMMF_STRIDED
     static_assert(BN == 64 || BN == 32, "a block reads one 64-column tile of words and scales, or its half");
 #else
-    static_assert(BN == 64 || BN == 32 || (MODE == BF16 && BN == 128), "packed column tiles");
+    static_assert(BN == 64 || BN == 32 || ((MODE == BF16 || MODE == FP8G) && BN == 128), "packed column tiles");
 #endif
     extern __shared__ __align__(128) unsigned char buf[];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -59,11 +59,32 @@
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;"
                              :: "r"(bar), "r"(T::W) : "memory");
-#pragma unroll
-                for (int t = 0; t < BN / 64; ++t) {
-                    const void* src = w + (static_cast<size_t>(n0 / 64 + t) * KG + g) * TILE_BYTES;
+                if constexpr (BN == 32) {
+                    const int half = (n0 % 64) / 32;
+                    const void* src = w + (static_cast<size_t>(n0 / 64) * KG + g) * TILE_BYTES + half * (TILE_BYTES / 2);
                     asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
-                                 :: "r"(smem(pw + t * TILE_BYTES)), "l"(src), "r"(TILE_BYTES), "r"(bar) : "memory");
+                                 :: "r"(smem(pw)), "l"(src), "r"(T::W), "r"(bar) : "memory");
+                } else {
+#pragma unroll
+                    for (int t = 0; t < BN / 64; ++t) {
+                        const void* src = w + (static_cast<size_t>(n0 / 64 + t) * KG + g) * TILE_BYTES;
+                        asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
+                                     :: "r"(smem(pw + t * TILE_BYTES)), "l"(src), "r"(TILE_BYTES), "r"(bar) : "memory");
+                    }
+                }
+            }
+            if constexpr (T::S > 0) {
+                constexpr int SCALE_TILE = MODE == FP4 || MODE == FP8G ? 64 * 4 : 64 * 2;
+                unsigned char* ps = pw + T::W;
+                if constexpr (BN == 32) {
+                    const int half = (n0 % 64) / 32;
+                    for (int c = tid; c < T::S / 16; c += T::THREADS)
+                        cp16(ps + c * 16, bs + (static_cast<size_t>(n0 / 64) * KG + g) * (2 * T::S) + half * T::S + c * 16);
+                } else {
+                    for (int c = tid; c < T::S / 16; c += T::THREADS) {
+                        const int t = c / (SCALE_TILE / 16), off = c % (SCALE_TILE / 16);
+                        cp16(ps + c * 16, bs + (static_cast<size_t>(n0 / 64 + t) * KG + g) * SCALE_TILE + off * 16);
+                    }
                 }
             }
         } else
@@ -96,9 +117,12 @@
             cp16(pw + c * 16, w + (static_cast<size_t>(n0 / 64 + t) * KG + g) * TILE_BYTES + off * 16);
         }
         if constexpr (T::S > 0) {
+            constexpr int SCALE_TILE = MODE == FP4 || MODE == FP8G ? 64 * 4 : 64 * 2;
             unsigned char* ps = pw + T::W;
-            for (int c = tid; c < T::S / 16; c += T::THREADS)
-                cp16(ps + c * 16, bs + (static_cast<size_t>(n0 / 64) * KG + g) * T::S + c * 16);
+            for (int c = tid; c < T::S / 16; c += T::THREADS) {
+                const int t = c / (SCALE_TILE / 16), off = c % (SCALE_TILE / 16);
+                cp16(ps + c * 16, bs + (static_cast<size_t>(n0 / 64 + t) * KG + g) * SCALE_TILE + off * 16);
+            }
         }
         }
     };
@@ -202,8 +226,13 @@
                     b1 = v.y;
                 } else {
                     const uint32_t word = comp(wq[j], kt);
+#if TF_FP_NATIVE
+                    b0 = tf_common::e4m3x2(word);
+                    b1 = tf_common::e4m3x2(word >> 16);
+#else
                     b0 = fp8pair(word & 0xFFFFu);
                     b1 = fp8pair(word >> 16);
+#endif
                 }
 #pragma unroll
                 for (int i = 0; i < T::MT; ++i) {
@@ -302,6 +331,12 @@
                     float* dst = reinterpret_cast<float*>(out) + static_cast<size_t>(row) * ldy + col;
 #else
                     float* dst = reinterpret_cast<float*>(out) + static_cast<size_t>(row) * N + col;
+                    if (SK == 1 && part != nullptr) {
+                        const float* prev = part + static_cast<size_t>(row) * N + col;
+                        if (col < N) dst[0] = __fadd_rn(prev[0], v0);
+                        if (col + 1 < N) dst[1] = __fadd_rn(prev[1], v1);
+                        continue;
+                    }
 #endif
                     if (col < N) dst[0] = v0;
                     if (col + 1 < N) dst[1] = v1;
