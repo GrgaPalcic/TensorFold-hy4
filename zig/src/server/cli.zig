@@ -8,7 +8,6 @@ pub const Kind = enum {
     store_true, // --flag
     append, // repeatable --flag VALUE
 };
-
 pub const Flag = struct {
     name: []const u8,
     kind: Kind = .value,
