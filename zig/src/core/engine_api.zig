@@ -93,6 +93,8 @@ pub const Request = struct {
     cache_key: []const u32 = &.{},
     /// A streamed reply's tokens its client has not read yet (the server's mailbox counts them); null: not watched.
     unread: ?*const std.atomic.Value(u32) = null,
+    /// A prompt filled in more than one call sends ``progress`` events before its first token (off: none).
+    return_progress: bool = false,
 
     /// The prompt as the prompt cache matches it: an image request's placeholders stand for their images.
     pub fn cacheKey(r: *const Request) []const u32 {
