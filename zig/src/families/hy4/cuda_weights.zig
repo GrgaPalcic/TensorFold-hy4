@@ -117,7 +117,8 @@ pub const Moe = struct {
     router_q: qmmf.Weight, // router packed for the bf16 tensor-core lane (prefill widths)
     bias: u64, // fp32 [experts] (e_score_correction_bias)
     down_shared: qmmf.Weight, // stacked [latent_down, shared.gate, shared.up] [latent + 2*sw, hidden] bf16 (R >= 2)
-    down_shared_half: ?qmmf.Weight = null, // stacked [latent_down_half (latent/2), shared.gate, shared.up] bf16 (R == 1, world == 2)
+    down_shared_part: ?qmmf.Weight = null, // stacked [this rank's latent_down rows (latent / ld_shards), shared.gate, shared.up] bf16 (R <= 64)
+    ld_shards: usize = 1, // ranks `down_shared_part`'s latent_down rows are split over; 1 when unsharded
     latent_up: qmmf.Weight, // routed_expert_up_proj [hidden, latent], replicated: it takes a rank's partial sums
     experts: cuda.experts.Layer, // fp8g, each expert's share of its intermediate width
     shared_down: qmmf.Weight, // shared.down [hidden, sw] bf16
@@ -327,11 +328,11 @@ pub const Weights = struct {
             .moe => |m| {
                 const share = try partition.expert(c, at.rank, at.world);
                 const ss = try partition.ffn(m.shared.gate.dim(0), at.rank, at.world);
-                const do_shard_ld = shard_replicated and at.world == 2 and (c.latent % 128 == 0);
-                const ld_half: Share = .{ .lo = at.rank * (c.latent / 2), .len = c.latent / 2 };
-                const ds_half: ?qmmf.Weight = if (do_shard_ld)
+                const do_shard_ld = shard_replicated and at.world >= 2 and (c.latent % (64 * at.world) == 0);
+                const ld_part: Share = .{ .lo = at.rank * (c.latent / at.world), .len = c.latent / at.world };
+                const ds_part: ?qmmf.Weight = if (do_shard_ld)
                     try w.projPin1(&.{
-                        .{ .p = .{ .bf16 = m.latent_down }, .rows = ld_half },
+                        .{ .p = .{ .bf16 = m.latent_down }, .rows = ld_part },
                         .{ .p = .{ .bf16 = m.shared.gate }, .rows = ss },
                         .{ .p = .{ .bf16 = m.shared.up }, .rows = ss },
                     }, all)
@@ -352,7 +353,8 @@ pub const Weights = struct {
                             .{ .p = .{ .bf16 = m.shared.gate }, .rows = ss },
                             .{ .p = .{ .bf16 = m.shared.up }, .rows = ss },
                         }, all),
-                        .down_shared_half = ds_half,
+                        .down_shared_part = ds_part,
+                        .ld_shards = if (do_shard_ld) at.world else 1,
                         .latent_up = try w.projPin1(&.{.{ .p = .{ .bf16 = m.latent_up }, .rows = all }}, .{ .lo = 0, .len = c.latent }),
                         .experts = .{
                             .format = .fp8g,

@@ -210,8 +210,17 @@ pub const Pages = struct {
     }
 };
 
-/// Uploads `row_caches` (and `row_slots_dev` when paged) for a batched step (`rows <= max_batch`).
+/// Uploads `row_caches` (and `row_slots_dev` when paged) for a batched step, only when its slots or lengths changed.
 pub fn uploadStepTables(m: *fwd.Model, s: Stream, parts: []const fwd.Model.Part, sqs: []const *fwd.Seq, rows: usize) !void {
+    var same = parts.len == m.table_key_parts;
+    var mla0s: [@import("cuda_layer.zig").max_segs]u64 = undefined;
+    for (parts, sqs, 0..) |p, sq, i| {
+        mla0s[i] = sq.cache.buf.ptr;
+        if (same and (p.slot != m.table_key_slots[i] or p.tokens.len != m.table_key_lens[i] or mla0s[i] != m.table_key_mla0[i])) {
+            same = false;
+        }
+    }
+    if (same) return;
     if (m.pages) |pg| {
         var rslots: [fwd.max_batch]i32 = @splat(0);
         var rr: usize = 0;
@@ -223,15 +232,6 @@ pub fn uploadStepTables(m: *fwd.Model, s: Stream, parts: []const fwd.Model.Part,
         }
         try cuda.copy_source.enqueue(m.d, pg.row_slots_dev.ptr, std.mem.sliceAsBytes(rslots[0..rows]), s);
     }
-    var same = parts.len == m.table_key_parts;
-    var mla0s: [@import("cuda_layer.zig").max_segs]u64 = undefined;
-    for (parts, sqs, 0..) |p, sq, i| {
-        mla0s[i] = sq.cache.buf.ptr;
-        if (same and (p.slot != m.table_key_slots[i] or p.tokens.len != m.table_key_lens[i] or mla0s[i] != m.table_key_mla0[i])) {
-            same = false;
-        }
-    }
-    if (same) return;
     var table: [config.max_layers * fwd.max_batch]u64 = @splat(0);
     for (0..m.active_layers) |l_idx| {
         var r: usize = 0;

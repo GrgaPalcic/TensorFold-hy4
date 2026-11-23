@@ -198,20 +198,20 @@ fn moe(k: *const Kernels, s: Stream, c: Config, e: weights.Moe, x_: *const Scrat
         p.recordMoeItems(s, x_.plan.counts);
     }
     const sw = e.shared_width;
-    const use_half_ds = rows <= 64 and e.down_shared_half != null and comm != null and comm.?.gather_bf16 != null;
-    const ld_local = if (use_half_ds) c.latent / 2 else c.latent;
+    const use_half_ds = rows <= 64 and e.down_shared_part != null and comm != null and comm.?.gather_bf16 != null;
+    const ld_local = if (use_half_ds) c.latent / e.ld_shards else c.latent;
     const ds_stride = ld_local + 2 * sw;
     var up_x: u64 = x_.gu;
     var up_stride: usize = ds_stride;
     if (use_half_ds) {
         const cm = comm.?;
-        try k.lane.matmul(s, x, c.hidden, rows, e.down_shared_half.?, x_.gu, x_.part);
+        try k.lane.matmul(s, x, c.hidden, rows, e.down_shared_part.?, x_.gu, x_.part);
         if (rows == 1) {
             try cm.gather_bf16.?(cm.ctx, s, x_.gu, x_.latent, ld_local);
         } else {
             try k.rows.sliceBf16(s, x_.gu, ds_stride, x_.comb, ld_local, rows);
             try cm.gather_bf16.?(cm.ctx, s, x_.comb, x_.act, rows * ld_local);
-            try k.rows.interleave2Bf16(s, x_.act, x_.latent, ld_local, rows);
+            if (e.ld_shards == 2) try k.rows.interleave2Bf16(s, x_.act, x_.latent, ld_local, rows) else try k.rows.interleaveBf16(s, x_.act, x_.latent, ld_local, rows, e.ld_shards, 0);
         }
         up_x = x_.latent;
         up_stride = c.latent;

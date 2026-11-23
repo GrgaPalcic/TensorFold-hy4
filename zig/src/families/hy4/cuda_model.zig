@@ -291,11 +291,11 @@ pub const Model = struct {
             }
             head = try cuda_head.Head.load(d, try names.top(&ck, c), c, opts.at);
             errdefer head.deinit();
-            const shard_rep_env = blk: {
+            // TF_HY4_SHARD_REP=0 keeps qkv_a and latent_down whole on every rank (on: world 4 gains 0.96 ms a token)
+            const shard_rep = opts.tp_sess != null and blk: {
                 const v = @import("profile").lookup("TF_HY4_SHARD_REP") orelse break :blk true;
                 break :blk v.len == 0 or v[0] != '0';
             };
-            const shard_rep = shard_rep_env and opts.tp_sess != null and opts.at.world == 2;
             for (0..active) |l_idx| {
                 const l = try names.layer(&ck, c, l_idx);
                 layers[l_idx] = try cuda_layer.Layer.loadEx(gpa, d, l, c, l_idx, opts.at, shard_rep);

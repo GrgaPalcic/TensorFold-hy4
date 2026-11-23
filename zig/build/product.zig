@@ -34,6 +34,8 @@ const Options = struct {
     version: ?[]const u8,
     nvcc: ?[]const u8,
     prebuilt: ?[]const u8,
+    /// -Dnative-fp-decode with -Dnvcc: fp8_experts, qmmf and prompt16 decode E4M3 / E2M1 pairs in hardware (sm_<n>a)
+    native_fp: bool,
     /// the first option given that the product does not read (a development build option, or none at all)
     other: ?[]const u8,
 
@@ -48,6 +50,7 @@ const Options = struct {
             .version = b.option([]const u8, "version", "Release version, exactly MAJOR.MINOR.PATCH"),
             .nvcc = b.option([]const u8, "nvcc", "nvcc (or a wrapper) that builds the kernel images"),
             .prebuilt = b.option([]const u8, "fatbins", "absolute directory of prebuilt <name>.fatbin files, each checked for its one SASS profile"),
+            .native_fp = b.option(bool, "native-fp-decode", "Hardware E4M3 / E2M1 pair decode in the FP8 and FP4 images (-Dnvcc, nvcc 13.2 or newer)") orelse false,
             .other = null,
         };
         o.other = undeclared(b); // last: it declares only what the lines above did not
@@ -85,10 +88,11 @@ fn refusal(b: *std.Build, name: []const u8, gpu: ?Gpu, o: Options) ?[]const u8 {
                 if (b.user_input_options.contains(option)) return b.fmt("-D{s}: -Dgpu={s} builds CUDA, where the HIP options do not apply", .{ option, name });
             }
             if ((o.nvcc == null) == (o.prebuilt == null)) return b.fmt("-Dgpu={s} needs exactly one of -Dnvcc and -Dfatbins", .{name});
+            if (o.native_fp and o.prebuilt != null) return "-Dnative-fp-decode: only applies with -Dnvcc, not -Dfatbins";
             if (os != .linux and os != .windows) return b.fmt("-Dgpu={s}: CUDA servers build for Linux and Windows targets", .{name});
         },
         .hip => {
-            for ([_][]const u8{ "nvcc", "fatbins" }) |option| {
+            for ([_][]const u8{ "nvcc", "fatbins", "native-fp-decode" }) |option| {
                 if (b.user_input_options.contains(option)) return b.fmt("-D{s}: -Dgpu={s} builds HIP, where the CUDA options do not apply", .{ option, name });
             }
             if (os != .linux) return b.fmt("-Dgpu={s}: HIP servers build for Linux targets", .{name});
@@ -137,7 +141,7 @@ fn cudaServer(b: *std.Build, o: Options, build_options: *std.Build.Step.Options,
     const check = b.addRunArtifact(b.addExecutable(.{ .name = "check-product-fatbins", .root_module = b.createModule(.{ .root_source_file = b.path("zig/build/check_product_fatbins.zig"), .target = b.graph.host }) }));
     for (catalog.kernels, &images) |k, *image| {
         if (o.nvcc) |tool| {
-            image.* = @import("cuda_fatbin.zig").fatbin(b, tool, version.?, k, sm);
+            image.* = @import("cuda_fatbin.zig").fatbin(b, tool, version.?, catalog.nativeFp(b.allocator, k, o.native_fp), sm);
         } else {
             const path = b.graph.cwdRelativePath(b.pathJoin(&.{ o.prebuilt.?, b.fmt("{s}.fatbin", .{k.name}) }));
             image.* = path;

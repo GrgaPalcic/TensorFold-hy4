@@ -117,9 +117,9 @@ pub const Weights = struct {
     eps: f32,
     hidden: usize,
     q_lora: usize,
-    qkv_sharded: bool = false, // true at world == 2 when qkv_a_half is loaded for decode (R <= 64)
-    qkv_a: Packed, // stacked [q_a (q_lora), kv_a (576)] x hidden bf16, full (used for prefill R > 64 or world != 2)
-    qkv_a_half: ?Packed = null, // row-sharded half [800, hidden] bf16 used at world == 2 for decode (R <= 64)
+    qkv_shards: usize = 1, // ranks `qkv_a_part` is row-split over for decode (R <= 64); 1 when every rank reads it whole
+    qkv_a: Packed, // stacked [q_a (q_lora), kv_a (576)] x hidden bf16, full (prefill R > 64, or unsharded)
+    qkv_a_part: ?Packed = null, // this rank's rows [(q_lora + 576) / world, hidden] bf16 for decode (R <= 64)
     q_b: Packed, // this rank's heads' rows
     gate: Packed, // linear_gate: this rank's heads' rows
     o: Packed, // o_proj: this rank's heads' input columns
@@ -154,14 +154,14 @@ pub const Weights = struct {
         w.hidden = hd;
         w.q_lora = c.q_lora;
         const qkv_total = c.q_lora + latent + rope;
-        const do_shard = shard_replicated and world == 2 and (qkv_total % 16 == 0);
-        w.qkv_sharded = do_shard;
+        const do_shard = shard_replicated and world >= 2 and (qkv_total % (16 * world) == 0);
+        w.qkv_shards = if (do_shard) world else 1;
         w.qkv_a = try packBf16PairSlice(d, gpa, t.q_a.bytes, c.q_lora, t.kv_a.bytes, latent + rope, hd, 0, qkv_total);
         errdefer w.qkv_a.deinit();
         w.qkv_a.w = try qmmf.pinned(w.qkv_a.w, 1);
-        w.qkv_a_half = if (do_shard) try packBf16PairSlice(d, gpa, t.q_a.bytes, c.q_lora, t.kv_a.bytes, latent + rope, hd, rank * (qkv_total / 2), qkv_total / 2) else null;
-        errdefer if (w.qkv_a_half) |*qh| qh.deinit();
-        if (w.qkv_a_half) |*qh| qh.w = try qmmf.pinned(qh.w, 1);
+        w.qkv_a_part = if (do_shard) try packBf16PairSlice(d, gpa, t.q_a.bytes, c.q_lora, t.kv_a.bytes, latent + rope, hd, rank * (qkv_total / world), qkv_total / world) else null;
+        errdefer if (w.qkv_a_part) |*qh| qh.deinit();
+        if (w.qkv_a_part) |*qh| qh.w = try qmmf.pinned(qh.w, 1);
         w.q_b = try pack(d, gpa, t.q_b, all * q_head, c.q_lora, share.q_rows, whole(c.q_lora));
         errdefer w.q_b.deinit();
         w.q_b.w = try qmmf.pinned(w.q_b.w, 1);
@@ -197,7 +197,7 @@ pub const Weights = struct {
     }
 
     pub fn deinit(w: *Weights) void {
-        if (w.qkv_a_half) |*qh| qh.deinit();
+        if (w.qkv_a_part) |*qh| qh.deinit();
         for ([_]*Packed{ &w.qkv_a, &w.q_b, &w.gate, &w.o }) |p| p.deinit();
         for ([_]*DeviceBuffer{ &w.kv_b, &w.uk, &w.uv, &w.q_a_norm, &w.kv_a_norm, &w.post_norm, &w.sinks, &w.freqs }) |b| b.free();
     }

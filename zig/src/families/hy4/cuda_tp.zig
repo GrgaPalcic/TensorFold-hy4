@@ -131,6 +131,9 @@ pub const Session = struct {
         if (profile.lookup("TF_COMM_BACKEND") == null and image.len > 0 and (opts.world == 2 or cfg.roce_relay)) {
             cfg.backend = .roce;
         }
+        if (profile.lookup("TF_TP_ROCE_RELAY_MAX_KB") == null and cfg.roce_relay) {
+            cfg.roce_relay_max_bytes = 512 * 1024;
+        }
         const s = try gpa.create(Session);
         errdefer gpa.destroy(s);
         const sum_mod = try cuda.rank_scatter.RankScatter.load(d);

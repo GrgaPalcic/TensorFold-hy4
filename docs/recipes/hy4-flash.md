@@ -195,18 +195,35 @@ python -I tools/zig/hy4_reference.py MODEL OUT --layers 0,1,2,3,4,5 --tokens 256
 
 ## Build and multi-rank transport
 
-- Prebuild kernel fatbins once (`zig build fatbins -Dnvcc=/usr/local/cuda/bin/nvcc -Dsm=121`) plus `tp_mailbox.fatbin`,
-  then iterate with `zig build native -Dfatbins=/path/to/fatbins -Doptimize=ReleaseFast` and set
+- **Recommended DGX Spark build (`nvcc >= 13.2`):**
+  `zig build -Dgpu=spark -Dnvcc=/usr/local/cuda/bin/nvcc -Dnative-fp-decode`.
+  Compiles the three FP8 kernels (`fp8_experts`, `qmmf`, `prompt16`) with Blackwell hardware FP8 pair-decode instead of
+  the software LUT (`tf-cuda-test native-fp` verifies bit-identical outputs across finite pairs). Code default remains
+  off for compatibility; refused on HIP and with `-Dfatbins`.
+- **Recommended serve config (1M context):**
+  Set `TF_KV_SHARE=32`, `TENSORFOLD_MEMORY_RESERVE_GIB=8`, ConnectX-7 `NCCL_*` / `TF_TP_ROCE_*` vars below, and on 4×
+  Spark `TF_HY4_ENGRAM_MODE=resident` (`5.74M` KV pool; omit for NVMe / `7.63M`; 2× always NVMe / `2.79M`–`3.18M`).
+  Launch each rank with `--tp 4 --rank <0..3> --master <RANK0_IP>` (or `--tp 2 --rank <0|1>`) plus:
+  `--precision full --context 1048576 --parallel 8 --kv-cache fp8 --vision --learn-conversations`.
+- **Fallback build for `nvcc 13.0` / `13.1` (or fast fatbin iteration):**
+  Omit `-Dnative-fp-decode` (`zig build -Dgpu=spark -Dnvcc=/usr/local/cuda/bin/nvcc`), or prebuild kernel fatbins once
+  (`zig build fatbins -Dnvcc=/usr/local/cuda/bin/nvcc -Dsm=121`) plus `tp_mailbox.fatbin`, then iterate with
+  `zig build native -Dfatbins=/path/to/fatbins -Doptimize=ReleaseFast` and set
   `TF_TP_KERNEL_IMAGE=/path/to/fatbins/tp_mailbox.fatbin` so `tp_roce` stays active without recompiling `.cu` units.
 - Set identical `TENSORFOLD_CHECKPOINT_SHA256` across ranks to skip hashing all 267.4 GiB on cold unified memory.
 - On dual-function ConnectX-7 links, assign both PCIe x8 RDMA functions on shared `/24` subnets and set
   `NCCL_IB_HCA==rocep1s0f1:1,roceP2p1s0f1:1`, `NCCL_IB_ADDR_RANGE=<SUBNET>/23` (covering both fabric `/24` subnets),
   `NCCL_PROTO=Simple`, `TF_TP_ROCE_FAST=1`, and `TF_TP_MAILBOX_MAX_KB=1024` (covering batched/DFly2 windows; add
-  `TF_TP_ROCE_RELAY=1` and a ring `NCCL_GRAPH_FILE` on switchless 4-rank CX7 rings).
+  `TF_TP_ROCE_RELAY=1` and a ring `NCCL_GRAPH_FILE` on switchless 4-rank CX7 rings; Hy4 defaults the relay ceiling
+  to `512 KiB` (`TF_TP_ROCE_RELAY_MAX_KB`) so verify windows of 6 rows and more stay off NCCL's ~290 us path).
 - Seam reductions (`cuda_tp.zig` `sumRankOrder`) use one-step `allReduce` at `world = 2` (`0 B` `gather_buf`),
-  `RankScatter.run` + `ncclAllGather` on full-mesh `world = 4`, and `tp_roce` multi-rank relay (`<= 1 MiB`) plus ring
-  `ncclAllGather` + `tf_rank_sum` (`> 1 MiB`, 0-bit-exact rank-0-first `fp32` summation) on switchless 4-rank rings;
-  NVMe snapshot recall (`Op.snap_load`) streams from rank 0 via ring `ncclBroadcast`.
+  `RankScatter.run` + `ncclAllGather` on full-mesh `world = 4`, and `tp_roce` multi-rank relay (up to the relay
+  ceiling) plus ring `ncclAllGather` + `tf_rank_sum` (above it, 0-bit-exact rank-0-first `fp32` summation) on
+  switchless 4-rank rings; NVMe snapshot recall (`Op.snap_load`) streams from rank 0 via ring `ncclBroadcast`.
+- Decode (`R <= 64`) row-splits the replicated `qkv_a` and `latent_down` over the ranks at any world whose shapes
+  divide and gathers the parts (`TF_HY4_SHARD_REP=0`: whole on every rank). At `world = 4` that is 168 collectives a
+  token instead of 85 and 0.96 ms less (26.56 -> 25.60 ms, one stream). The scheduler prices windows with a `world = 4`
+  cost table there (verify 25.9 ms at 1 row, 70.1 at 16; `world = 2`: 38 and 128).
 
 ## Checks
 
@@ -278,3 +295,31 @@ python -I tools/zig/hy4_reference.py MODEL OUT --layers 0,1,2,3,4,5 --tokens 256
   `hy4-invariance` checks pass with `0` bit differences across `world ∈ {1, 2, 4}`, scrambled `256`-token `page_table` matches
   contiguous `runTail` + `bf16`/`fp8` MLA with `0` bit diffs, `hy4-tail-kv8` layer cosine `0.99998`, and `hy4-vit` matches
   PyTorch `fp32` (`cos = 1.00000`, `rmse = 0.00304`).
+
+### 2026-11-23 update (recommended 1M Spark setup, distinct-prompt matrix & 128K/256K prose)
+
+Measured in the recommended `1M` Spark serving config (`--precision full --context 1048576 --parallel 8 --kv-cache fp8 --vision --learn-conversations`,
+`TF_KV_SHARE=32`, `512 KiB` default Hy4 relay ceiling, `TF_HY4_SHARD_REP=1`, `world = 4` draft cost table, and the
+recommended `-Dnative-fp-decode` Spark build on GB10 `sm_121`). All multi-stream throughput numbers below use distinct prompts (`cached = 0`):
+
+| Workload (`cached = 0`, recommended `1M` FP8 setup) | `TP=4` (`v0.1.0-hy4` -> today, Resident Engram, `5.74M` KV pool) | `TP=2` (today, NVMe Engram, `2.79M` KV pool) | Notes |
+|---|---|---|---|
+| `tools/bench_prose.py` (`350tok_prose`, 8 distinct novels) | `116.6` -> **`139.5 tok/s`** (`+19.6%`; plain `113.7` -> `134.7`, 4s `86.3` -> `97.2`, 1s plain `38.0` -> `40.6`) | `83.8` (`84.3` plain, 4s `59.8`, 1s `32.1` / `26.6` plain) | `32K` BF16 launch config (`-Dnative-fp-decode`, 3-rep median): `scoreboard.py` 1s `58.0` -> **`64.5 tok/s`** (`+11.2%`, `64.57/64.47/63.94`; plain `37.5` -> `41.9`), `tools/bench_prose.py` 8s `123.5` -> **`139.7 tok/s`** (`+13.1%`, `139.66/144.00/139.13`) |
+| `tools/bench_prose.py` (`2.5Ktok_chapter`, 8 distinct novels) | `100.5` -> **`120.7 tok/s`** (`+20.1%`; 4s `79.8` -> `91.5`, 1s `48.5` -> `49.8`) | — | `32K` BF16 launch config: `102.1` -> **`121.0 tok/s`** (`+18.6%`) |
+| `tools/bench_concurrent.py --prompts tools/bench_prompts.json` (`t=1.0`, distinct; 1s is `quicksort-raw` Python code) | 1s `80.7` -> **`85.8`**, 4s `103.6` -> **`114.7`** (`145.9` steady), 8s `128.0` -> **`142.9 tok/s`** (`+11.6%`, `187.4` steady) | — | `32K` BF16 launch config: 1s `74.0` -> `80.9`, 4s `103.0` -> `122.0`, 8s `122.5` -> `133.7` |
+| `tools/bench_concurrent.py --prompts tools/bench_prompts.json` (`t=0.0`, distinct) | 1s `54.5` -> **`55.7`**, 4s `100.3` -> **`115.1`** (`+14.8%`), 8s `122.5` -> **`137.4 tok/s`** (`+12.2%`, `177.1` steady) | — | `32K` BF16 launch config: 1s `82.5` -> `89.7`, 4s `104.4` -> `117.3`, 8s `121.8` -> `136.8` |
+| Cold `32K` prefill (recommended `1M` FP8 setup) | `1,863–1,864 tok/s` | **`1,893.5–1,902.5 tok/s`** | `TP=2` `1M` FP8 `32K`: `1,847–1,855` -> `1,893.5–1,902.5` (`+2.4%`) |
+| Real prose `128K` (first `134,276` tok of *War and Peace*) | `1,824.6 tok/s` (`73.59 s`) -> `49.54` drafted / `38.80` plain | `1,853.5 tok/s` (`72.45 s`) -> `32.70` drafted / `26.20` plain | Plain decode retains `93.5%` (`TP=4`) and `95.4%` (`TP=2`) of `0K` plain |
+| Real prose `256K` (first `268,252` tok of *Les Misérables*) | `1,780.1 tok/s` (`150.70 s`) -> `42.30` drafted / `38.17` plain | `1,804.8 tok/s` (`148.63 s`) -> `28.52` drafted / `26.22` plain | Plain decode retains `92.0%` (`TP=4`) and `95.5%` (`TP=2`) of `0K` plain; drafted acceptance tapers with context length |
+
+- **4-rank ring relay (`tf-tp-test suite`):** eager half-forwarding cuts 4 KB all-gather `21.10 -> 14.10 us` (`-33.2%`),
+  8 KB `22.08 -> 17.58 us` (`-20.4%`), and `decode_window` `22.12 -> 17.70 us` (`-20.0%`), `328/328` checks pass.
+- **Exactness:** bit-identical greedy outputs and 42-layer FP64 `ids_t64` logits across SW vs `-Dnative-fp-decode` and
+  `TF_HY4_SHARD_REP=0` vs `1`; `bench_concurrent.py` `12/12` cells, `0` fail, `0` unequal (`156/156` alone, `54/54`
+  serial) at both `TP=2` and `TP=4`; all five Hy4 CUDA contracts plus `hy4-tail-kv8` and `native-fp` pass.
+- **Fallback build check (`nvcc 13.0/13.1`, without `-Dnative-fp-decode`, exact Nov 21 `--context 32768` `bf16` KV launch config on
+  `TP=4` Resident Engram):** `scoreboard.py` solo `57.96 -> 62.64 tok/s` (`+8.1%`) drafted / `37.53 -> 41.71 tok/s`
+  (`+11.1%`) plain, `4`-stream `110.39 -> 145.83 tok/s`, cold `32K` prefill `1,945 -> 1,967 tok/s` (`2K` `1,853`, `8K`
+  `1,956`); `real_prose_bench.py` `8` distinct novels `123.49 -> 138.18 tok/s` (`+11.9%`, `138.34` plain). Against
+  `v0.1.0-hy4`, `3/3` greedy prompts and a `3,849`-token multi-turn prose session are bit-identical and share the exact
+  same on-disk NVMe conversation directory format.

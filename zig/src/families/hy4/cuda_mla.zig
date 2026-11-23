@@ -199,22 +199,22 @@ pub const GatherBf16 = struct {
     gather: *const fn (ctx: *anyopaque, s: Stream, send: u64, recv: u64, count_bf16: usize) anyerror!void,
 };
 
-/// Computes `[q_a, kv_a] = qkv_a(x)` into `.qa` and `q_resid = q_a_layernorm(q_a)` (TP=2 `qkv_a_half` at `rows <= 64`).
+/// Computes `[q_a, kv_a] = qkv_a(x)` into `.qa` and `q_resid = q_a_layernorm(q_a)` (row-sharded part at `rows <= 64`).
 pub fn qkvPrep(ops: Ops, s: Stream, w: *const Weights, sc: *const Scratch, x: u64, rows: usize, gather: ?GatherBf16, rows_op: ?*const @import("cuda_rows.zig").Rows) !void {
     if (rows > sc.rows or w.heads != sc.heads) return error.ScratchShape;
     if (rows == 0) return;
     const q_lora: usize = w.q_lora;
     const qkv_stride = q_lora + row;
-    if (rows <= 64 and w.qkv_sharded) {
-        if (w.qkv_a_half) |qh| {
+    if (rows <= 64 and w.qkv_shards > 1) {
+        if (w.qkv_a_part) |qh| {
             const g = gather orelse return error.MissingAllReduce;
-            const half = qkv_stride / 2;
+            const part = qkv_stride / w.qkv_shards;
             try ops.lane.matmul(s, x, w.hidden, rows, qh.w, sc.at(.q), sc.lanePart());
             if (rows == 1) {
-                try g.gather(g.ctx, s, sc.at(.q), sc.at(.qa), half);
+                try g.gather(g.ctx, s, sc.at(.q), sc.at(.qa), part);
             } else {
-                try g.gather(g.ctx, s, sc.at(.q), sc.at(.ql), rows * half);
-                try rows_op.?.interleave2Bf16(s, sc.at(.ql), sc.at(.qa), half, rows);
+                try g.gather(g.ctx, s, sc.at(.q), sc.at(.ql), rows * part);
+                if (w.qkv_shards == 2) try rows_op.?.interleave2Bf16(s, sc.at(.ql), sc.at(.qa), part, rows) else try rows_op.?.interleaveBf16(s, sc.at(.ql), sc.at(.qa), part, rows, w.qkv_shards, 0);
             }
             try ops.norms.rmsParts(s, sc.at(.qa), qkv_stride, 0, w.q_a_norm.ptr, 0, sc.at(.qres), q_lora, 0, null, rows, 1, q_lora, w.eps, false);
             return;

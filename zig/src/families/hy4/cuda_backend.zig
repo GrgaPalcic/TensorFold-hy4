@@ -31,24 +31,37 @@ const hy4_window_costs = [fwd.max_window]lanes.config.Cost{
     .{ .width = 13, .ms = 116.0 }, .{ .width = 14, .ms = 120.0 }, .{ .width = 15, .ms = 124.0 }, .{ .width = 16, .ms = 128.0 },
 };
 
-fn sharedCostTable() [fwd.max_batch]lanes.config.Cost {
+// Measured TP=4 verify(R) on the four-rank ring (2026-11-23): a row costs about half of what it does at TP=2.
+const hy4_window_costs_w4 = [fwd.max_window]lanes.config.Cost{
+    .{ .width = 1, .ms = 25.9 },  .{ .width = 2, .ms = 29.9 },  .{ .width = 3, .ms = 33.4 },  .{ .width = 4, .ms = 37.8 },
+    .{ .width = 5, .ms = 40.4 },  .{ .width = 6, .ms = 45.1 },  .{ .width = 7, .ms = 48.5 },  .{ .width = 8, .ms = 51.8 },
+    .{ .width = 9, .ms = 53.5 },  .{ .width = 10, .ms = 56.0 }, .{ .width = 11, .ms = 58.5 }, .{ .width = 12, .ms = 61.0 },
+    .{ .width = 13, .ms = 63.3 }, .{ .width = 14, .ms = 65.6 }, .{ .width = 15, .ms = 67.9 }, .{ .width = 16, .ms = 70.1 },
+};
+
+/// A shared round's cost by rows: `base` ms at one row, then `slopes` ms a row up to 8, 16, 32 rows and past 32.
+fn sharedCostTable(comptime base: f64, comptime slopes: [4]f64) [fwd.max_batch]lanes.config.Cost {
     var c: [fwd.max_batch]lanes.config.Cost = undefined;
+    const at8 = base + slopes[0] * 7;
+    const at16 = at8 + slopes[1] * 8;
+    const at32 = at16 + slopes[2] * 16;
     for (&c, 0..) |*x, i| {
         const w = i + 1;
         const ms: f64 = if (w <= 8)
-            38.0 + 7.8 * @as(f64, @floatFromInt(w - 1))
+            base + slopes[0] * @as(f64, @floatFromInt(w - 1))
         else if (w <= 16)
-            92.6 + 4.4 * @as(f64, @floatFromInt(w - 8))
+            at8 + slopes[1] * @as(f64, @floatFromInt(w - 8))
         else if (w <= 32)
-            127.8 + 3.7 * @as(f64, @floatFromInt(w - 16))
+            at16 + slopes[2] * @as(f64, @floatFromInt(w - 16))
         else
-            187.0 + 2.7 * @as(f64, @floatFromInt(w - 32));
+            at32 + slopes[3] * @as(f64, @floatFromInt(w - 32));
         x.* = .{ .width = @intCast(w), .ms = ms };
     }
     return c;
 }
 
-const hy4_shared_costs = sharedCostTable();
+const hy4_shared_costs = sharedCostTable(38.0, .{ 7.8, 4.4, 3.7, 2.7 });
+const hy4_shared_costs_w4 = sharedCostTable(26.0, .{ 4.0, 2.6, 2.0, 1.6 });
 
 pub const Lane = struct {
     slot: usize,
@@ -149,6 +162,7 @@ pub const Backend = struct {
 
     pub fn facts(b: *const Backend) lanes.Model {
         const dfly = b.m.hasDfly();
+        const w4 = if (b.m.tp_sess) |ts| ts.world >= 4 else false;
         return .{
             .fixed_draft_block = dfly,
             .root_copies = b.priority_copies,
@@ -163,8 +177,8 @@ pub const Backend = struct {
             .draft_streams = dfly,
             .mtp_step_ms = if (dfly) 1.1 else 0,
             .draft_step_ms = if (dfly) 1.1 else 0,
-            .window_costs = if (dfly) &hy4_window_costs else &.{},
-            .shared_costs = if (dfly) &hy4_shared_costs else &.{},
+            .window_costs = if (!dfly) &.{} else if (w4) &hy4_window_costs_w4 else &hy4_window_costs,
+            .shared_costs = if (!dfly) &.{} else if (w4) &hy4_shared_costs_w4 else &hy4_shared_costs,
             .allocate_shared_drafts = false,
             .shared_drafts = 0,
             .hidden_rows = true,
