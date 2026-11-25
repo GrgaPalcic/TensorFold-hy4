@@ -30,6 +30,7 @@ pub const cuda_after = @import("registry_media.zig").cuda ++
     @import("qwen3_asr_cuda_records.zig").cuda ++
     @import("zonos3_cuda_records.zig").cuda ++
     @import("hy4_engram_fp8_records.zig").cuda ++
+    @import("hy4_index_paged_records.zig").cuda ++
     @import("exl3_dense_records.zig").cuda ++
     @import("exl3_finish_records.zig").cuda ++
     @import("lfm2_moe_cuda_records.zig").cuda ++
@@ -198,4 +199,5 @@ test {
     _ = @import("qmmf_many_records.zig");
     _ = @import("hy4_route_rows_records.zig");
     _ = @import("hy4_engram_fp8_records.zig");
+    _ = @import("hy4_index_paged_records.zig");
 }
